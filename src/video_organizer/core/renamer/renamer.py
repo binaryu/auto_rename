@@ -4185,6 +4185,9 @@ class VideoRenamer:
                 metadata["original_title"] = details.get("original_title", "")
                 metadata["original_language"] = details.get("original_language", "")
                 metadata["origin_country"] = details.get("origin_country", [])
+                metadata["production_countries"] = [
+                    c["iso_3166_1"] for c in details.get("production_countries", [])
+                ]
                 metadata["release_date"] = details.get("release_date", "")
                 # 提取电影年份
                 if metadata["release_date"]:
