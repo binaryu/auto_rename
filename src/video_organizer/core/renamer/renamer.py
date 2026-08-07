@@ -3071,7 +3071,21 @@ class VideoRenamer:
             # 使用处理后的年份（过滤了无效年份）
             # 注意：对于电视剧不传年份，因为文件名中的年份可能是任意一季的播出年份，
             # 而 TMDB 的 first_air_date_year 只匹配第一季首播年份，会导致多季剧集搜不到
-            if media_type_hint == "tv":
+            # 如果搜索词是纯数字且等于年份，则搜索词本身是片名而非年份标记
+            # 如 "1980.1080p.mkv" → show_name="1980", year="1980"
+            # 此时 year 应作为片名搜索，不应作为年份过滤，否则退化为"最热门的1980年电影"
+            _search_show_name = metadata.get("show_name", "")
+            if (
+                _search_show_name
+                and year_int is not None
+                and str(_search_show_name) == str(year_int)
+                and str(_search_show_name).isdigit()
+            ):
+                search_year = None
+                logger.info(
+                    f"搜索词 '{_search_show_name}' 等于年份，视为片名，跳过年份过滤"
+                )
+            elif media_type_hint == "tv":
                 search_year: Optional[str] = None
             else:
                 search_year: Optional[str] = str(year_int) if year_int else None
