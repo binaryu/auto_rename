@@ -1601,6 +1601,29 @@ class GuessItParser:
                 if merged.get("media_type") == "tv":
                     merged["media_type"] = "movie"
 
+        # 检测 GuessIt 是否把文件名中的年份（括号内）误拆成 season+episode
+        # 如 "Flower of Evil (1915) 1080p TrueHD.iso" → regex year=1915, GuessIt season=19, episode=15
+        # 判断条件：regex 提取了年份，GuessIt 的 season+episode 拼接后等于该年份
+        regex_year = regex_metadata.get("year")
+        if (
+            regex_year
+            and str(regex_year).isdigit()
+            and guessit_metadata.get("season") is not None
+            and guessit_metadata.get("episode") is not None
+        ):
+            guessit_season = str(guessit_metadata["season"])
+            guessit_episode = str(guessit_metadata["episode"])
+            if guessit_season + guessit_episode == str(regex_year):
+                logger.warning(
+                    f"检测到 GuessIt 将年份 '{regex_year}' 在 '{filename}' 中"
+                    f"误拆为 season={guessit_metadata['season']}, episode={guessit_metadata['episode']}，"
+                    f"纠正为 movie"
+                )
+                merged["season"] = None
+                merged["episode"] = None
+                if merged.get("media_type") == "tv":
+                    merged["media_type"] = "movie"
+
         # 媒体类型：如果正则没有识别，使用 guessit 结果
         # 如果正则通过弱信号（无 SxxExx/第X季/EPxx 等强格式标记）判定为 tv，
         # 而 GuessIt 判定为其他类型，优先使用 GuessIt（避免 DTS-X 等技术标签误触发）
