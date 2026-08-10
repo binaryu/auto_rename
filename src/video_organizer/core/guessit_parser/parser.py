@@ -1712,6 +1712,49 @@ class GuessItParser:
         if guessit_metadata.get("episode_title") and not merged.get("episode_title"):
             merged["episode_title"] = guessit_metadata["episode_title"]
 
+        # ===== 文件名优先原则：防止父目录合集容器污染类型 =====
+        # 如 "电影频道合集16 CCTV6.Collection.Vol.16.../密战.ts" → 完整路径被 GuessIt
+        # 解析为 season=6, episode=16, type=tv，但文件名 "密战.ts" 单独解析是 movie。
+        # 当文件名自身有有效标题、无季集信号，且父目录是合集容器（合集/合辑/Collection/Vol/Part）时，
+        # 完整路径解析出的 season/episode 来自合集序号，应以文件名为准（参考 MoviePilot 分开解析再合并）。
+        filename_only = Path(filename).name if filename else ""
+        parent_name = Path(filename).parent.name if filename else ""
+        if filename_only and filename_only != filename and parent_name:
+            is_collection_container = bool(
+                re.search(
+                    r"合集|合辑|[Cc]ollection|Vol\.?\s?\d|[Vv]olume|Part\s?\d",
+                    parent_name,
+                )
+            )
+            if is_collection_container:
+                try:
+                    filename_meta = self.parse(filename_only)
+                except Exception as e:
+                    filename_meta = {}
+                    logger.debug(f"单独解析文件名失败: {filename_only}, {e}")
+                if filename_meta:
+                    file_show = filename_meta.get("show_name")
+                    file_has_title = bool(file_show) and not self._is_invalid_show_name(
+                        file_show
+                    )
+                    file_has_signal = bool(
+                        filename_meta.get("season") or filename_meta.get("episode")
+                    )
+                    merged_has_signal = bool(
+                        merged.get("season") or merged.get("episode")
+                    )
+                    if file_has_title and not file_has_signal and merged_has_signal:
+                        logger.warning(
+                            f"父目录 '{parent_name}' 为合集容器，文件名 '{filename_only}' "
+                            f"单独解析为 '{file_show}' 无季集信号，"
+                            f"纠正完整路径误判的 season/episode，以文件名为准"
+                        )
+                        merged["show_name"] = file_show
+                        merged["season"] = None
+                        merged["episode"] = None
+                        if filename_meta.get("media_type"):
+                            merged["media_type"] = filename_meta["media_type"]
+
         return merged
 
     def create_guessit_parser(config: Optional[Dict] = None) -> GuessItParser:
