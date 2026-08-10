@@ -3700,7 +3700,38 @@ class VideoRenamer:
                                     search_term = llm_show_name
                                     search_year = llm_search_year
                                 else:
-                                    logger.warning(f"LLM识别后TMDB搜索无结果，识别失败")
+                                    # 如果 LLM 提供了 tmdb_corrected_title，用纠正后的标题重试
+                                    corrected_title = llm_result.get("tmdb_corrected_title")
+                                    if corrected_title:
+                                        logger.info(
+                                            f"LLM搜索无结果，尝试纠正后的TMDB标题: '{corrected_title}'"
+                                        )
+                                        corrected_results = self._search_with_language(
+                                            corrected_title,
+                                            search_media_type,
+                                            llm_search_year,
+                                            llm_primary_language,
+                                        ) or self._search_with_language(
+                                            corrected_title,
+                                            search_media_type,
+                                            llm_search_year,
+                                            llm_secondary_language,
+                                        )
+                                        if corrected_results:
+                                            logger.info(
+                                                f"纠正标题后搜索返回 {len(corrected_results)} 个结果"
+                                            )
+                                            results = corrected_results[:5]
+                                            search_term = corrected_title
+                                            search_year = llm_search_year
+                                        else:
+                                            logger.warning(
+                                                f"纠正标题后搜索仍无结果，识别失败"
+                                            )
+                                    else:
+                                        logger.warning(
+                                            f"LLM识别后TMDB搜索无结果，识别失败"
+                                        )
                             else:
                                 logger.warning(f"LLM parse_filename返回空结果，识别失败")
                         except Exception as e:

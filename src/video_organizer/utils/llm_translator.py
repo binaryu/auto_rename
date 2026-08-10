@@ -451,12 +451,18 @@ class LLMTranslator:
 文件名: {filename}
 
 返回格式示例:
-{{"show_name":"剧名","season":1,"episode":2,"year":2023,"release_group":"发布组","media_type":"tv","original_language":"en"}}
+// TV 示例
+{{"show_name":"剧名","tmdb_corrected_title":null,"season":1,"episode":2,"year":2023,"release_group":"发布组","media_type":"tv","original_language":"en"}}
+// Movie 示例
+{{"show_name":"电影名","tmdb_corrected_title":null,"season":null,"episode":null,"year":2023,"release_group":"发布组","media_type":"movie","original_language":"en"}}
 
 提取规则:
 - show_name: 纯剧名，不含 S/E、年份、分辨率、发布组
   * 注意：剧名可能使用特殊字符防和谐，如"追·恶""追•恶"应识别为"追恶"
   * 常见防和谐字符：· • _ - 空格等，需还原为正常剧名
+- tmdb_corrected_title: 如果文件名中的剧名与 TheMovieDB 官方收录名不一致，返回 TMDB 官方名；一致则返回 null
+  * 例如：文件名"香港奇案之银行大劫案" → TMDB 官名为"香港奇案之表行大劫案"
+  * 不知道 TMDB 官方名时返回 null，不要随意猜测
 - season/episode: 数字或 null
 - year: 四位年份数字或 null
 - release_group: 发布组名或 null
