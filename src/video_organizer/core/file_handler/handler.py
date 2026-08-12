@@ -19,7 +19,15 @@ from ..renamer import VideoRenamer
 from ..tmdb_client import TMDBClient
 from ..subtitle_handler import SubtitleHandler
 from ..downloader import decode_file_path
-from ...utils.logging_utils import get_logger, log_success, log_failure, log_exception
+from ...utils.logging_utils import (
+    get_logger,
+    log_success,
+    log_failure,
+    log_exception,
+    set_file_id,
+    clear_file_id,
+    with_file_id,
+)
 from ...database.operations import record_task
 from ...database.session import init_db as init_task_db
 
@@ -33,8 +41,8 @@ def console_log(message: str):
 
     替代直接 print() 调用，确保日志被记录到文件
     """
-    # 输出到控制台
-    print(message)
+    # 输出到控制台（加上当前文件标识，便于并发时区分）
+    print(with_file_id(message))
 
     # 写入日志文件（移除 ANSI 颜色代码）
     import re
@@ -636,6 +644,9 @@ class VideoFileHandler:
                     print(f"DEBUG: 工作线程 #{worker_id} 收到退出信号")
                     break
 
+                # 为当前文件的处理设置日志标识，之后产生的日志都会带上 [编号 文件名]
+                set_file_id(file_path)
+
                 print(f"DEBUG: 工作线程 #{worker_id} 获取到任务: {file_path}")
 
                 # 显示队列状态
@@ -654,6 +665,7 @@ class VideoFileHandler:
                     )
                 finally:
                     # 清理状态（不持有锁，避免阻塞其他线程）
+                    clear_file_id()
                     self._queued_files.discard(file_path)
                     self._processing_files.discard(file_path)
 
@@ -864,6 +876,8 @@ class VideoFileHandler:
         """
         内部文件处理逻辑（包含元数据获取、API调用、上传）
         """
+        # 为当前文件的处理设置日志标识（幂等：若已由 worker 设置则复用同一编号）
+        set_file_id(file_path)
         console_log(f"\n🔍 [线程#{worker_id}] 开始深入处理文件: {file_path}")
 
         try:
@@ -1195,6 +1209,8 @@ class VideoFileHandler:
                 self.logger.info(f"将文件添加到重试队列: {file_path}")
                 self._parent_monitor._retry_files.add(file_path)
         finally:
+            # 清除当前文件的日志标识
+            clear_file_id()
             # 从处理中集合移除
             self._processing_files.discard(file_path)
 

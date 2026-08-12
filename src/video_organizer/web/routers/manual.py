@@ -15,6 +15,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from ..services.state import get_state_manager
+from ...utils.logging_utils import set_file_id, clear_file_id
 
 logger = logging.getLogger(__name__)
 
@@ -331,15 +332,19 @@ def _do_preview(raw_path: str, config: dict) -> PreviewResponse:
 
     tmdb_client = get_state_manager().get_tmdb_client()
 
-    renamer = VideoRenamer(
-        tmdb_api_key=tmdb_config.get("api_key", ""),
-        naming_rules=config.get("naming_rules", config.get("naming", {})),
-        config=config,
-    )
-    if tmdb_client:
-        renamer.tmdb_client = tmdb_client
+    set_file_id(raw_path)
+    try:
+        renamer = VideoRenamer(
+            tmdb_api_key=tmdb_config.get("api_key", ""),
+            naming_rules=config.get("naming_rules", config.get("naming", {})),
+            config=config,
+        )
+        if tmdb_client:
+            renamer.tmdb_client = tmdb_client
 
-    metadata = renamer.extract_metadata(raw_path)
+        metadata = renamer.extract_metadata(raw_path)
+    finally:
+        clear_file_id()
 
     title = metadata.get("show_name") or metadata.get("title") or None
     raw_year = metadata.get("year")
@@ -422,15 +427,19 @@ def _do_validate(raw_path: str, config: dict, media_type: Optional[str] = None) 
 
     tmdb_client = get_state_manager().get_tmdb_client()
 
-    renamer = VideoRenamer(
-        tmdb_api_key=tmdb_config.get("api_key", ""),
-        naming_rules=config.get("naming_rules", config.get("naming", {})),
-        config=config,
-    )
-    if tmdb_client:
-        renamer.tmdb_client = tmdb_client
+    set_file_id(raw_path)
+    try:
+        renamer = VideoRenamer(
+            tmdb_api_key=tmdb_config.get("api_key", ""),
+            naming_rules=config.get("naming_rules", config.get("naming", {})),
+            config=config,
+        )
+        if tmdb_client:
+            renamer.tmdb_client = tmdb_client
 
-    metadata = renamer.extract_metadata(parse_input, media_type_hint=media_type)
+        metadata = renamer.extract_metadata(parse_input, media_type_hint=media_type)
+    finally:
+        clear_file_id()
 
     title = metadata.get("show_name") or metadata.get("title") or None
     raw_year = metadata.get("year")

@@ -8,6 +8,8 @@ from typing import Any, Dict, Optional
 
 import websockets
 
+from ..utils.logging_utils import set_file_id, clear_file_id
+
 logger = logging.getLogger(__name__)
 
 VIDEO_EXT = ('.mp4', '.mkv', '.avi', '.rmvb', '.mov', '.wmv', '.flv', '.ts', '.m2ts', '.webm')
@@ -235,6 +237,7 @@ class MediaTrackerClient:
 
     def _handle_new_media_sync(self, payload: Dict):
         file_name = payload.get("file_name", "")
+        set_file_id(file_name)
         sha256 = payload.get("sha256", "")
         file_size = payload.get("file_size", 0)
         tmdb_id = payload.get("tmdb_id")
@@ -249,6 +252,7 @@ class MediaTrackerClient:
 
         if not file_name or not sha256 or not file_size:
             logger.warning("new_media \u6570\u636e\u4e0d\u5b8c\u6574: %s", payload)
+            clear_file_id()
             return
 
         logger.info("\u5904\u7406 new_media: %s (%s bytes)", file_name, file_size)
@@ -503,11 +507,15 @@ class MediaTrackerClient:
 
         except Exception as e:
             logger.error("\u5904\u7406 new_media \u5931\u8d25 (%s): %s", file_name, e, exc_info=True)
+        finally:
+            clear_file_id()
 
     def _handle_media_deleted_sync(self, payload: Dict):
         sha256 = payload.get("sha256", "")
+        set_file_id(payload.get("file_name") or sha256 or "deleted")
         if not sha256:
             logger.warning("media_deleted \u6570\u636e\u7f3a\u5c11 sha256: %s", payload)
+            clear_file_id()
             return
         logger.info("\u5904\u7406 media_deleted: sha256=%s...", sha256[:16])
         if self.emya_controller:
@@ -518,16 +526,19 @@ class MediaTrackerClient:
                 logger.warning("emya \u5220\u9664\u5931\u8d25: %s", result.message)
         else:
             logger.info("emya_controller \u672a\u542f\u7528\uff0c\u8df3\u8fc7\u5220\u9664")
+        clear_file_id()
 
     def _handle_media_updated_sync(self, payload: Dict):
         sha256 = payload.get("sha256", "")
         file_name = payload.get("file_name", "")
+        set_file_id(file_name)
         file_size = payload.get("file_size", 0)
         tmdb_id = payload.get("tmdb_id")
         suggested_path = payload.get("suggested_path", "")
 
         if not sha256 or not suggested_path or not tmdb_id:
             logger.warning("media_updated \u6570\u636e\u4e0d\u5b8c\u6574: %s", payload)
+            clear_file_id()
             return
 
         logger.info("\u5904\u7406 media_updated: %s (tmdb_id=%s)", file_name, tmdb_id)
@@ -537,6 +548,7 @@ class MediaTrackerClient:
         parts = [p for p in suggested_path.split("\\") if p]
         if len(parts) < 1:
             logger.warning("media_updated suggested_path \u65e0\u6548: %s", suggested_path)
+            clear_file_id()
             return
         renamed_filename = parts[-1]
         folder_parts = [p for p in parts[:-1] if p and p.lower() != "media"]
@@ -577,6 +589,7 @@ class MediaTrackerClient:
 
             if not emya_media_url:
                 logger.warning("media_updated: \u65e0\u6cd5\u6784\u5efa media_url\uff0c\u8df3\u8fc7\u91cd\u65b0\u5165\u5e93")
+                clear_file_id()
                 return
 
             tmdb_client = getattr(self.renamer, 'tmdb_client', None) if self.renamer else None
@@ -595,3 +608,4 @@ class MediaTrackerClient:
                             emya_result.data.get("video_id"), emya_result.data.get("title"))
             else:
                 logger.warning("emya \u91cd\u65b0\u5165\u5e93\u5931\u8d25: %s", emya_result.message)
+        clear_file_id()

@@ -430,12 +430,13 @@ def start_web_server(
             logger.info(f"Web 管理后台启动于 http://{host}:{port}")
             cli_output.print_success(f"Web 管理后台: http://{host}:{port}")
 
-            # 运行服务器
+            # 运行服务器（log_config=None 避免 uvicorn 重置根 logger 的 handler，保证文件日志可用）
             uvicorn.run(
                 app,
                 host=host,
                 port=port,
                 log_level="warning",  # 减少 uvicorn 日志输出
+                log_config=None,
             )
 
         except ImportError as e:
@@ -717,6 +718,7 @@ def main() -> None:
                     host=args.web_host,
                     port=args.web_port,
                     reload=args.web_reload,
+                    log_config=None,
                 )
             except ImportError:
                 cli_output.print_error(

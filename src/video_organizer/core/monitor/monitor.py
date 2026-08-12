@@ -15,6 +15,7 @@ from typing import Dict, Optional, List
 # 导入更新后的VideoFileHandler
 from ..file_handler import VideoFileHandler
 from ..downloader import DownloaderMonitorFactory, decode_file_path, resolve_file_path
+from ...utils.logging_utils import set_file_id, clear_file_id
 
 logger = logging.getLogger(__name__)
 
@@ -499,6 +500,7 @@ class FileSystemMonitor:
         Args:
             file_path: 文件路径
         """
+        set_file_id(file_path)
         try:
             logger.info(f"开始处理目录文件: {file_path}")
 
@@ -545,6 +547,8 @@ class FileSystemMonitor:
 
         except Exception as e:
             logger.error(f"处理目录文件时发生错误: {file_path}, 错误: {e}")
+        finally:
+            clear_file_id()
 
     def _scrape_metadata(self, file_path: Path, metadata: dict):
         """

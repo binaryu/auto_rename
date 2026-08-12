@@ -1,3 +1,5 @@
+import contextvars
+import itertools
 import logging
 import logging.handlers
 import os
@@ -9,6 +11,12 @@ from typing import Dict, Any, Optional
 LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
+# 当前处理文件的日志标识（线程/协程隔离），用于并发处理时区分不同文件的日志
+_current_file_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "current_file_id", default=""
+)
+_file_seq = itertools.count(1)  # 全局递增序号，区分同一文件的不同处理批次
+
 # 日志级别映射
 LOG_LEVELS = {
     "DEBUG": logging.DEBUG,
@@ -17,6 +25,65 @@ LOG_LEVELS = {
     "ERROR": logging.ERROR,
     "CRITICAL": logging.CRITICAL,
 }
+
+
+def _truncate_middle(text: str, max_len: int = 48) -> str:
+    """从中间截断长文件名，保留开头（片名）和结尾（画质/扩展名）"""
+    if len(text) <= max_len:
+        return text
+    keep_right = 18
+    keep_left = max_len - keep_right - 1  # 减 1 给省略号
+    return f"{text[:keep_left]}…{text[-keep_right:]}"
+
+
+def make_file_id(file_path_or_name: str) -> str:
+    """生成文件日志标识，形如 '#12 爱恋.S01E01.1080p.BluRay...'"""
+    normalized = str(file_path_or_name).replace("\\", "/")
+    name = os.path.basename(normalized) or normalized
+    return f"#{next(_file_seq)} {_truncate_middle(name)}"
+
+
+def set_file_id(file_path_or_name: str) -> None:
+    """为当前上下文设置文件日志标识；已设置则不重复分配，保证一次处理只用一个编号"""
+    if not _current_file_id.get():
+        _current_file_id.set(make_file_id(file_path_or_name))
+
+
+def clear_file_id() -> None:
+    """清除当前上下文的文件日志标识"""
+    _current_file_id.set("")
+
+
+def get_file_id() -> str:
+    """获取当前上下文的文件日志标识，无则为空字符串"""
+    return _current_file_id.get()
+
+
+def with_file_id(message: str) -> str:
+    """给消息加上当前文件标识前缀（供控制台 print 使用，写入日志的由 Formatter 处理）"""
+    file_id = get_file_id()
+    if file_id:
+        return f"[{file_id}] {message}"
+    return message
+
+
+class TaskIdFilter(logging.Filter):
+    """把当前线程/协程的文件标识注入到每条日志记录中"""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.file_id = get_file_id()
+        return True
+
+
+class TaskIdFormatter(logging.Formatter):
+    """在日志行最前面加上 [文件标识]，没有标识时不加"""
+
+    def format(self, record: logging.LogRecord) -> str:
+        line = super().format(record)
+        file_id = getattr(record, "file_id", "")
+        if file_id:
+            return f"[{file_id}] {line}"
+        return line
 
 
 def setup_logging(config: Optional[Dict[str, Any]] = None) -> None:
@@ -48,13 +115,14 @@ def setup_logging(config: Optional[Dict[str, Any]] = None) -> None:
     root_logger.setLevel(log_level)
 
     # 创建格式化器
-    formatter = logging.Formatter(LOG_FORMAT, DATE_FORMAT)
+    formatter = TaskIdFormatter(LOG_FORMAT, DATE_FORMAT)
 
     # 添加控制台处理器
     if default_config["console_log"]:
         console_handler = logging.StreamHandler(sys.stdout)
         console_handler.setLevel(log_level)
         console_handler.setFormatter(formatter)
+        console_handler.addFilter(TaskIdFilter())
         root_logger.addHandler(console_handler)
 
     # 添加文件处理器
@@ -86,6 +154,7 @@ def setup_logging(config: Optional[Dict[str, Any]] = None) -> None:
             )
             file_handler.setLevel(log_level)
             file_handler.setFormatter(formatter)
+            file_handler.addFilter(TaskIdFilter())
             root_logger.addHandler(file_handler)
             root_logger.info(f"日志文件已设置: {log_file} (maxBytes={max_bytes}, backupCount={backup_count})")
         except Exception as e:
@@ -192,9 +261,10 @@ def configure_log_rotation(
     Returns:
         轮转文件处理器
     """
-    formatter = logging.Formatter(LOG_FORMAT, DATE_FORMAT)
+    formatter = TaskIdFormatter(LOG_FORMAT, DATE_FORMAT)
     handler = logging.handlers.RotatingFileHandler(
         file_path, maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8"
     )
     handler.setFormatter(formatter)
+    handler.addFilter(TaskIdFilter())
     return handler
