@@ -133,8 +133,11 @@ DEFAULT_RELEASE_GROUP_MAPPING = {
 
 def determine_anime_subcategory(
     metadata: Dict, origin_countries: List, original_language: str,
+    adult: bool = False,
 ) -> str:
     """根据元数据确定动漫子分类（国漫、日番、欧美动漫等）"""
+    if adult:
+        return "里番"
     chinese_countries = ["CN", "HK", "TW"]
     english_countries = ["US", "GB", "CA", "AU", "NZ"]
 
@@ -232,12 +235,12 @@ def determine_category(
         elif any(genre in genre_names for genre in ["reality", "variety", "综艺", "game show", "真人秀"]):
             sub_category = "综艺"
         elif any(genre in genre_names for genre in ["animation", "animated", "动画"]):
-            sub_category = determine_anime_subcategory(metadata, origin_countries, original_language)
+            sub_category = determine_anime_subcategory(metadata, origin_countries, original_language, adult=metadata.get("adult", False))
         elif any(genre in genre_names for genre in ["kids", "children", "child", "儿童", "family"]):
             sub_category = "儿童"
         else:
             if forced_content_type == "anime":
-                sub_category = determine_anime_subcategory(metadata, origin_countries, original_language)
+                sub_category = determine_anime_subcategory(metadata, origin_countries, original_language, adult=metadata.get("adult", False))
                 logger.info(f"基于字幕组映射判定为动漫: {sub_category}")
             elif original_language in ["zh", "cn"] or any(
                 country in chinese_countries for country in origin_countries

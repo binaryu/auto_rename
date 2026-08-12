@@ -450,22 +450,13 @@ async def yun139_create_get_download_url(
 # ==================== 123 云盘秒传代理 ====================
 
 
-@router.get("/redirect/{file_size}/{etag}/{s3keyflag}/{file_name}")
-async def p123_get_download_url(
+def _p123_handle_redirect(
     file_size: int,
     etag: str,
-    s3keyflag: str,
     file_name: str,
-    request: Request,
-):
-    """
-    123 云盘秒传代理
-    通过 etag(MD5) + s3keyflag 创建文件并返回视频直链（302 重定向）。
-
-    专用于 123 STRM 文件播放流程:
-    /redirect/{file_size}/{etag}/{s3keyflag}/{file_name}
-    """
-    client_ip = _get_client_ip(request)
+    client_ip: str,
+    s3keyflag: Optional[str] = None,
+) -> Response:
     key = _cache_key("123", client_ip, etag)
 
     cached = _cache_get(key)
@@ -508,6 +499,7 @@ async def p123_get_download_url(
         )
 
     data = upload_resp.get("data", {})
+    logger.info(f"data={data}")
     if not data.get("Reuse"):
         return JSONResponse(
             status_code=500,
@@ -515,9 +507,17 @@ async def p123_get_download_url(
         )
 
     file_id = data.get("FileId") or data.get("Info", {}).get("FileId")
-    logger.info(f"123 秒传 data: Reuse={data.get('Reuse')}, FileId={file_id}, Key={data.get('Key')}")
+    logger.info(
+        f"123 秒传 data: Reuse={data.get('Reuse')}, FileId={file_id}, Key={data.get('Key')}"
+    )
     if not file_id:
         return JSONResponse(status_code=500, content={"error": "秒传响应中无 FileId"})
+
+    # 未提供 s3keyflag 时从秒传响应中提取
+    if not s3keyflag:
+        s3keyflag = data.get("Info", {}).get("S3KeyFlag", "") or data.get(
+            "S3KeyFlag", ""
+        )
 
     # 获取直链
     file_info = {
@@ -553,3 +553,49 @@ async def p123_get_download_url(
     # 缓存 1 小时 + 302
     _cache_set(key, download_url, 3600)
     return _make_302(download_url, 3600)
+
+
+@router.get("/redirect/{file_size}/{etag}/{file_name}")
+async def p123_get_download_url_no_s3keyflag(
+    file_size: int,
+    etag: str,
+    file_name: str,
+    request: Request,
+):
+    """
+    123 云盘秒传代理（兼容旧链接，s3keyflag 从秒传响应中提取）
+    兼容旧版 STRM 链接:
+    /redirect/{file_size}/{etag}/{file_name}
+    """
+    client_ip = _get_client_ip(request)
+    return _p123_handle_redirect(
+        file_size=file_size,
+        etag=etag,
+        file_name=file_name,
+        client_ip=client_ip,
+    )
+
+
+@router.get("/redirect/{file_size}/{etag}/{s3keyflag}/{file_name}")
+async def p123_get_download_url(
+    file_size: int,
+    etag: str,
+    s3keyflag: str,
+    file_name: str,
+    request: Request,
+):
+    """
+    123 云盘秒传代理
+    通过 etag(MD5) + s3keyflag 创建文件并返回视频直链（302 重定向）。
+
+    专用于 123 STRM 文件播放流程:
+    /redirect/{file_size}/{etag}/{s3keyflag}/{file_name}
+    """
+    client_ip = _get_client_ip(request)
+    return _p123_handle_redirect(
+        file_size=file_size,
+        etag=etag,
+        file_name=file_name,
+        client_ip=client_ip,
+        s3keyflag=s3keyflag,
+    )

@@ -5,6 +5,9 @@ TMDB API client for fetching TV show information.
 import logging
 import threading
 import time
+import re
+import urllib.request
+import urllib.parse
 from typing import List, Dict, Optional, Callable
 from collections import OrderedDict, deque
 import requests
@@ -19,6 +22,12 @@ DEGRADED_RATE_LIMIT_PER_SEC = 20
 DEGRADE_DURATION = 30.0
 # 请求缓存默认容量（条）
 DEFAULT_CACHE_SIZE = 512
+# TMDB 网站搜索偏好 Cookie（设置语言/时区/成人内容，提高搜索结果匹配度）
+TMDB_WEB_COOKIE = (
+    'preferences='
+    '{"adult":true,"i18n_fallback_language":"en-US",'
+    '"locale":"zh-CN","country_code":"US","timezone":"Asia/Shanghai"}'
+)
 
 
 class _GlobalRateLimiter:
@@ -688,3 +697,112 @@ class TMDBClient:
             # 返回结果列表
             return result["results"]
         return []
+
+    def search_web_fallback(
+        self, query: str, language: str = "zh-CN",
+        media_type: Optional[str] = None,
+    ) -> List[Dict]:
+        """
+        TMDB API 搜索无结果时，爬取 TMDB 网站搜索作为兜底。
+        网站搜索的模糊匹配能力比 API 更强，能搜到 API 找不到的条目。
+
+        Args:
+            query: 搜索词
+            language: 搜索语言（用于 Accept-Language 头）
+            media_type: 媒体类型筛选（"movie" 或 "tv"），避免类型串扰
+
+        Returns:
+            搜索结果列表，格式与 search_multi 一致
+        """
+        if media_type in ("movie", "tv"):
+            url = f"https://www.themoviedb.org/search/{media_type}?query={urllib.parse.quote(query)}"
+        else:
+            url = f"https://www.themoviedb.org/search?query={urllib.parse.quote(query)}"
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": f"{language},{language.split('-')[0]};q=0.9",
+            "Cookie": TMDB_WEB_COOKIE,
+        }
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            html = urllib.request.urlopen(req, timeout=15).read().decode(
+                "utf-8", "ignore"
+            )
+        except Exception as e:
+            logger.warning(f"TMDB 网站搜索失败: {e}")
+            return []
+
+        if not html:
+            return []
+
+        # 从 HTML 中提取 movie/tv 的 ID 和标题
+        # 网站搜索结果结构:
+        #   <a data-media-type="movie" href="/movie/131482">
+        #     <img alt="白云山传奇" class="poster" ...>
+        #   </a>
+        seen_ids = set()
+        results = []
+        # 匹配所有搜索结果卡片: <a ... data-media-type="movie|tv" href="/movie|tv/ID">
+        for match in re.finditer(
+            r'<a[^>]*?data-media-type="(movie|tv)"[^>]*?href="/(movie|tv)/(\d+)"[^>]*>',
+            html,
+        ):
+            card_media_type = match.group(1)
+            entity_id = match.group(3)
+            if entity_id in seen_ids:
+                continue
+            seen_ids.add(entity_id)
+
+            # 从这个 <a> 到下一个 <a> 之间找标题
+            a_start = match.start()
+            next_a = html.find("<a ", a_start + 1)
+            if next_a == -1:
+                next_a = a_start + 1000
+            a_content = html[a_start:next_a]
+
+            # 从 <img alt="TITLE"> 提取标题
+            title = ""
+            img_alt = re.search(r'<img[^>]*?alt="([^"]*)"', a_content)
+            if img_alt:
+                title = img_alt.group(1).strip()
+
+            if not title:
+                # 降级：从 <a> 的文本内容中提取
+                title_match = re.search(r">([^<]+)</a>", a_content)
+                if title_match:
+                    title = title_match.group(1).strip()
+
+            if title:
+                results.append({
+                    "id": int(entity_id),
+                    "media_type": card_media_type,
+                    "title": title,
+                    "name": title,
+                    "_web_fallback": True,
+                })
+
+        # 按请求的 media_type 过滤，避免类型串扰
+        # （TMDB 页面即使指定 /search/movie，仍可能包含 TV 卡片）
+        if media_type in ("movie", "tv"):
+            results = [r for r in results if r["media_type"] == media_type]
+
+        # 去重后保留前 5 条
+        seen = set()
+        deduped = []
+        for r in results:
+            if r["id"] not in seen:
+                seen.add(r["id"])
+                deduped.append(r)
+                if len(deduped) >= 5:
+                    break
+
+        if deduped:
+            logger.info(
+                f"TMDB 网站搜索找到 {len(deduped)} 个结果: "
+                f"{[r.get('title') or r.get('name') for r in deduped]}"
+            )
+        return deduped

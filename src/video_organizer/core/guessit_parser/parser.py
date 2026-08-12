@@ -1737,9 +1737,10 @@ class GuessItParser:
                     file_has_title = bool(file_show) and not self._is_invalid_show_name(
                         file_show
                     )
-                    file_has_signal = bool(
-                        filename_meta.get("season") or filename_meta.get("episode")
-                    )
+                    # 文件名自身的 TV 信号只看 episode：单独的 season 数字常是电影系列序号
+                    # （如 "反贪风暴2.ts" → season=2, episode=None 是电影续集，非季号）
+                    # 而 episode 是明确的剧集信号（如 "01.mp4" → episode=1）
+                    file_has_signal = bool(filename_meta.get("episode"))
                     merged_has_signal = bool(
                         merged.get("season") or merged.get("episode")
                     )

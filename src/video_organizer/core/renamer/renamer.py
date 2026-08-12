@@ -2195,6 +2195,28 @@ class VideoRenamer:
             logger.debug(f"_extract_with_regex: returning, metadata is None: {metadata is None}, keys: {list(metadata.keys()) if metadata else None}")
             return metadata
 
+        # 兜底：正则模式未匹配到 show_name 时，使用文件名（不含路径）作为 show_name
+        # 仅当文件名包含中文字符时启用（中文极少是质量标签/技术信息，
+        # 避免将 1080p.mkv、Toy.Story.4.2019.mp4 等误用为 show_name）
+        if "show_name" not in metadata:
+            basename = os.path.basename(base_name)
+            file_stem = os.path.splitext(basename)[0]
+            if file_stem and re.search(r"[\u4e00-\u9fff]", file_stem):
+                show_name = file_stem.replace("_", " ").replace(".", " ").strip()
+                show_name = re.sub(r"\s+", " ", show_name)
+                # 移除质量标签
+                quality_pattern = r"\b(1080p|720p|480p|360p|2160p|4k|uhd|fhd|bluray|bdrip|web-dl|webrip|hdr|sdr|hevc|h264|h265|x264|x265|aac|dts|ac3|ddp|truehd|atmos|5\.1|7\.1)\b"
+                show_name = re.sub(quality_pattern, "", show_name, flags=re.IGNORECASE)
+                # 移除年份
+                show_name = re.sub(r"\s*\d{4}\s*", "", show_name)
+                show_name = show_name.strip().rstrip(".")
+                show_name = re.sub(r"\s+", " ", show_name)
+                if show_name:
+                    metadata["show_name"] = show_name
+                    logger.debug(
+                        f"正则模式未匹配，使用中文文件名作为 show_name: {show_name}"
+                    )
+
         # Ensure we always return a dict (fallback when show_name not in metadata)
         return metadata or {}
 
@@ -2453,6 +2475,21 @@ class VideoRenamer:
                 )
                 if results:
                     logger.info(f"去掉年份后搜索到 {len(results)} 个结果")
+
+            # 3. Web 搜索兜底：API 搜索无结果时爬取 TMDB 网站
+            if not results and self.tmdb_client:
+                logger.info(
+                    f"API 搜索无结果，尝试 TMDB 网站搜索兜底: '{final_search_term}'"
+                )
+                web_results = self.tmdb_client.search_web_fallback(
+                    final_search_term, language=language,
+                    media_type=media_type_hint,
+                )
+                if web_results:
+                    results = web_results
+                    logger.info(
+                        f"TMDB 网站搜索返回 {len(results)} 个结果"
+                    )
         except Exception as e:
             logger.error(f"语言搜索失败: {e}")
 
@@ -2890,6 +2927,7 @@ class VideoRenamer:
                             metadata["genres"] = [genre["name"] for genre in details.get("genres", [])]
                             metadata["original_name"] = details.get("original_name", "")
                             metadata["original_language"] = details.get("original_language", "")
+                            metadata["adult"] = details.get("adult", False)
                             metadata["origin_country"] = details.get("origin_country", [])
                             metadata["first_air_date"] = details.get("first_air_date", "")
                             metadata["last_air_date"] = details.get("last_air_date", "")
@@ -2981,6 +3019,7 @@ class VideoRenamer:
                             metadata["genres"] = [genre["name"] for genre in details.get("genres", [])]
                             metadata["original_title"] = details.get("original_title", "")
                             metadata["original_language"] = details.get("original_language", "")
+                            metadata["adult"] = details.get("adult", False)
                             metadata["release_date"] = details.get("release_date", "")
                             metadata["runtime"] = details.get("runtime", 0)
                             metadata["status"] = details.get("status", "")
@@ -3228,15 +3267,22 @@ class VideoRenamer:
 
             # 如果第一次搜索没有结果，尝试通用搜索（分页）
             if not primary_results:
-                logger.info("第一次搜索无结果，尝试通用搜索（分页）...")
-                general_results = self.tmdb_client.search_all_pages(
-                    "search_video_show", prepared_search_term,
-                    max_pages=self.max_search_pages,
-                    year=search_year, language=primary_language,
-                )
-                if general_results:
-                    primary_results = general_results
-                    logger.info(f"通用搜索返回 {len(primary_results)} 个结果")
+                # 高置信度时，通用搜索应保持类型限定，避免多类型搜索引入非目标类型结果
+                if confidence >= 0.7 and media_type_hint:
+                    logger.info(
+                        f"第一次搜索无结果，高置信度({confidence:.2f})，"
+                        f"跳过通用搜索，保持{media_type_hint}类型"
+                    )
+                else:
+                    logger.info("第一次搜索无结果，尝试通用搜索（分页）...")
+                    general_results = self.tmdb_client.search_all_pages(
+                        "search_video_show", prepared_search_term,
+                        max_pages=self.max_search_pages,
+                        year=search_year, language=primary_language,
+                    )
+                    if general_results:
+                        primary_results = general_results
+                        logger.info(f"通用搜索返回 {len(primary_results)} 个结果")
 
                 # 通用搜索结果全是非首选类型且父目录名可用时，用父目录名搜索
                 if primary_results and media_type_hint and confidence >= 0.5:
@@ -4042,6 +4088,7 @@ class VideoRenamer:
                 ]
                 metadata["original_name"] = details.get("original_name", "")
                 metadata["original_language"] = details.get("original_language", "")
+                metadata["adult"] = details.get("adult", False)
                 metadata["origin_country"] = details.get("origin_country", [])
                 metadata["first_air_date"] = details.get("first_air_date", "")
                 metadata["last_air_date"] = details.get("last_air_date", "")
@@ -4229,6 +4276,7 @@ class VideoRenamer:
                 ]
                 metadata["original_title"] = details.get("original_title", "")
                 metadata["original_language"] = details.get("original_language", "")
+                metadata["adult"] = details.get("adult", False)
                 metadata["origin_country"] = details.get("origin_country", [])
                 metadata["production_countries"] = [
                     c["iso_3166_1"] for c in details.get("production_countries", [])
@@ -4339,7 +4387,7 @@ class VideoRenamer:
         self, metadata: Dict, origin_countries: List, original_language: str
     ) -> str:
         """根据元数据确定动漫子分类（国漫、日番、欧美动漫等）"""
-        return determine_anime_subcategory(metadata, origin_countries, original_language)
+        return determine_anime_subcategory(metadata, origin_countries, original_language, adult=metadata.get("adult", False))
 
     def _determine_category(self, metadata: Dict) -> str:
         """根据元数据确定视频的分类目录"""
