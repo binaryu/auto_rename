@@ -111,6 +111,8 @@ DEFAULT_CONFIG = {
         "weight": 1,
         "timeout": 30,
         "max_retries": 2,
+        "max_tokens": 4096,
+        "max_tokens_cap": 16384,
     },
     "llm_provider_2": {
         "name": "",
@@ -121,6 +123,8 @@ DEFAULT_CONFIG = {
         "weight": 1,
         "timeout": 30,
         "max_retries": 2,
+        "max_tokens": 4096,
+        "max_tokens_cap": 16384,
     },
     "llm_provider_3": {
         "name": "",
@@ -131,6 +135,8 @@ DEFAULT_CONFIG = {
         "weight": 1,
         "timeout": 30,
         "max_retries": 2,
+        "max_tokens": 4096,
+        "max_tokens_cap": 16384,
     },
     "guessit": {
         "enabled": True,  # 是否启用 GuessIt 增强识别
@@ -407,10 +413,17 @@ def _validate_config(config: Dict[str, Any]) -> bool:
             logger.info(f"监控目录不存在: {watch_dir}，当前使用下载器监控模式")
 
     # 验证TMDB API密钥
+    # 说明：此处仅检查当前这份 INI 文件中的 api_key。开发环境下 load_config 的
+    # 默认路径是 src/video_organizer/config.ini（通常是空模板），而实际使用的配置
+    # 往往在项目根目录的 config.ini 中（含真实密钥）。因此文件为空不等于最终不可用，
+    # 降级为 debug 避免误报警；真实的 TMDB 可用性由 TMDBClient 初始化时判断。
     if "tmdb" in config:
         api_key = config["tmdb"].get("api_key", "")
         if not api_key:
-            logger.warning("TMDB API密钥未配置，元数据刮削功能将不可用")
+            logger.debug(
+                "TMDB API密钥未在本配置文件中设置（实际配置可能在其它 config.ini 中提供），"
+                "届时元数据刮削将不可用"
+            )
 
     # 验证命名规则
     if "naming_rules" in config:

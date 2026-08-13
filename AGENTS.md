@@ -24,6 +24,8 @@
   - `tmdb_client.py` — TMDB API 客户端
   - `manual_rule_engine.py` — 手动规则 DSL 引擎
   - `guessit_parser.py` — GuessIt 集成 + 中文文件名预处理
+- **工具模块** (`src/video_organizer/utils/`):
+  - `llm_translator.py` — 多 Provider LLM 翻译器，支持文件名解析/翻译；负载均衡策略（round-robin/random/failover/weighted）；自动检测推理模型截断并升级 `max_tokens`
 - **Web 后端** (`web/`):
   - `app.py` — FastAPI 应用创建，`create_app()`
   - `auth.py` — HMAC-SHA256 令牌认证（非标准 JWT），服务重启所有 token 失效
@@ -32,6 +34,11 @@
 - **上传模块** (`upload/`): `yun139.py`/`upload_yun139.py`, `cloud189_upload.py`, `p123do.py`
 - **数据库** (`database/`): SQLAlchemy，用于 emya 入库和 DB 配置
 - **配置文件:** `config.ini`（实际）、`config_template.ini`（模板），首次运行自动生成
+- **LLM Provider 配置** (`[llm_provider_N]`):
+  - `api_url`, `api_key`, `model` — 基本连接参数
+  - `max_tokens` — 最大输出 token（默认 4096，推理模型需更大预算）
+  - `max_tokens_cap` — 截断时自动翻倍上限（默认 16384）
+  - `timeout`, `max_retries`, `weight`, `enabled` — 控制参数
 - **打包:** `build.sh` — PyInstaller 构建，spec 内嵌生成
 
 ## 代码约定
@@ -47,6 +54,13 @@
 - 正式镜像: `Dockerfile`（ENTRYPOINT + CMD `--web-only`）
 - 轻量镜像: `Dockerfile.run`（默认 `python run_organizer.py`，无 healthcheck）
 - `docker-compose.yml` 有 `video-organizer` 和 `video-organizer-dev` 两个 service
+
+## 已知问题
+
+- `tests/unit/test_core/test_manual_rule_engine.py::TestManualRuleEngine::test_locked_fields_union` 失败。
+  原因：`get_locked_fields()` 依赖 `apply()` 被调用后累积结果，而测试直接构造引擎后查询，
+  从未调用 `apply()`，导致返回空集合。这是测试与实现语义分歧，需要决定改实现
+  （静态推导 lock_fields）还是改测试。
 
 ## 调试
 

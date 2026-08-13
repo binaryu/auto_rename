@@ -372,6 +372,8 @@ class VideoRenamer:
                             "weight": provider_config.get("weight", 1),
                             "timeout": provider_config.get("timeout", 30),
                             "max_retries": provider_config.get("max_retries", 2),
+                            "max_tokens": provider_config.get("max_tokens", 4096),
+                            "max_tokens_cap": provider_config.get("max_tokens_cap", 16384),
                         })
 
             if providers:

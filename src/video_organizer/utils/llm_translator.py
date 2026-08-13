@@ -31,7 +31,13 @@ class LLMProvider:
     enabled: bool = True
     timeout: int = 30
     max_retries: int = 2
-    
+    # 单次请求允许的最大输出 token（推理模型需预留 reasoning 预算）
+    max_tokens: int = 4096
+    # 响应被截断（finish_reason=length）时，max_tokens 自动翻倍的上限
+    max_tokens_cap: int = 16384
+    # content 为空时的回退路径（适用于带 reasoning_content 的推理模型）
+    reasoning_content_path: str = "choices[0].message.reasoning_content"
+
     def __post_init__(self):
         if not self.api_key:
             self.enabled = False
@@ -182,6 +188,11 @@ class LLMTranslator:
                 enabled=cfg.get("enabled", True),
                 timeout=cfg.get("timeout", 30),
                 max_retries=cfg.get("max_retries", 2),
+                max_tokens=cfg.get("max_tokens", 4096),
+                max_tokens_cap=cfg.get("max_tokens_cap", 16384),
+                reasoning_content_path=cfg.get(
+                    "reasoning_content_path", "choices[0].message.reasoning_content"
+                ),
             )
             
             if provider.enabled and provider.api_key and provider.api_url:
@@ -197,6 +208,8 @@ class LLMTranslator:
             api_key=api_key,
             api_url=api_url,
             model=model,
+            max_tokens=4096,
+            max_tokens_cap=16384,
         )
         self.providers.append(provider)
         logger.info(f"LLMTranslator: 使用单Provider配置 (model={model})")
@@ -260,25 +273,37 @@ class LLMTranslator:
         }
         if provider.api_key:
             headers["Authorization"] = f"Bearer {provider.api_key}"
-        
-        payload = {
-            "model": provider.model,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": 1000,
-            "stream": False,
-        }
-        
-        if top_p is not None:
-            payload["top_p"] = top_p
-        
-        # 对于低温度参数的调用（通常是 JSON 解析），启用 response_format
-        if temperature <= 0.3:
-            payload["response_format"] = {"type": "json_object"}
-        
-        for attempt in range(provider.max_retries):
+
+        # 推理模型（带 reasoning_content）需要更大的 token 预算，
+        # 否则会先耗尽在「思考」阶段，导致 content 为空（finish_reason=length）。
+        current_max_tokens = provider.max_tokens
+        # 普通请求失败（超时/HTTP错误/格式异常）按 max_retries 重试；
+        # 截断（finish_reason=length）走独立的 max_tokens 升级，不消耗重试次数。
+        normal_failures = 0
+        attempt = 0
+
+        while normal_failures < provider.max_retries:
+            attempt += 1
+            payload = {
+                "model": provider.model,
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": current_max_tokens,
+                "stream": False,
+            }
+
+            if top_p is not None:
+                payload["top_p"] = top_p
+
+            # 对于低温度参数的调用（通常是 JSON 解析），启用 response_format
+            if temperature <= 0.3:
+                payload["response_format"] = {"type": "json_object"}
+
             try:
-                logger.debug(f"LLMTranslator: 调用Provider '{provider.name}' (attempt={attempt+1})")
+                logger.debug(
+                    f"LLMTranslator: 调用Provider '{provider.name}' "
+                    f"(attempt={attempt}, max_tokens={current_max_tokens})"
+                )
                 response = requests.post(
                     provider.api_url,
                     headers=headers,
@@ -286,24 +311,69 @@ class LLMTranslator:
                     timeout=provider.timeout,
                 )
                 response.raise_for_status()
-                
+
                 result = response.json()
                 logger.debug(f"LLMTranslator: result '{result}'")
+
+                # 提取 finish_reason，用于区分「截断」与「格式异常」
+                finish_reason = None
+                choices = result.get("choices") if isinstance(result, dict) else None
+                if isinstance(choices, list) and choices:
+                    finish_reason = choices[0].get("finish_reason")
+
                 content = ResponseParser.parse(result, provider.response_path)
-                
+
                 if content:
                     logger.debug(f"LLMTranslator: Provider '{provider.name}' 返回成功")
                     return content
-                else:
-                    logger.warning(f"LLMTranslator: Provider '{provider.name}' 返回格式异常: {result}")
-                    
+
+                # content 为空：先判断是否为 token 截断导致
+                if finish_reason == "length":
+                    logger.warning(
+                        f"LLMTranslator: Provider '{provider.name}' 响应被截断 "
+                        f"(finish_reason=length, max_tokens={current_max_tokens})，"
+                        f"尝试增大 max_tokens 重试"
+                    )
+                    next_max = min(current_max_tokens * 2, provider.max_tokens_cap)
+                    if next_max > current_max_tokens:
+                        current_max_tokens = next_max
+                        continue
+                    logger.warning(
+                        f"LLMTranslator: Provider '{provider.name}' 已达到 max_tokens 上限 "
+                        f"({provider.max_tokens_cap})，无法继续重试"
+                    )
+                    return None
+
+                # content 为空但存在 reasoning_content（推理模型），尝试回退
+                fallback = ResponseParser.parse(result, provider.reasoning_content_path)
+                if fallback:
+                    logger.debug(
+                        f"LLMTranslator: Provider '{provider.name}' "
+                        f"从 reasoning_content 回退取内容"
+                    )
+                    return fallback
+
+                logger.warning(
+                    f"LLMTranslator: Provider '{provider.name}' 返回格式异常: {result}"
+                )
+                normal_failures += 1
+
             except requests.exceptions.Timeout:
-                logger.warning(f"LLMTranslator: Provider '{provider.name}' 超时 (attempt={attempt+1})")
+                logger.warning(
+                    f"LLMTranslator: Provider '{provider.name}' 超时 (attempt={attempt})"
+                )
+                normal_failures += 1
             except requests.exceptions.RequestException as e:
-                logger.warning(f"LLMTranslator: Provider '{provider.name}' 请求失败: {e}")
+                logger.warning(
+                    f"LLMTranslator: Provider '{provider.name}' 请求失败: {e}"
+                )
+                normal_failures += 1
             except Exception as e:
-                logger.error(f"LLMTranslator: Provider '{provider.name}' 未知错误: {e}")
-        
+                logger.error(
+                    f"LLMTranslator: Provider '{provider.name}' 未知错误: {e}"
+                )
+                normal_failures += 1
+
         return None
     
     def _call_with_failover(
