@@ -57,11 +57,11 @@ class RobustEmosVideoUploader:
         self.base_url = base_url
         self.session = self._create_robust_session()
         self.headers = {
-            "accept": "*/*",
-            "accept-language": "zh-CN,zh;q=0.9",
+            # "accept": "*/*",
+            # "accept-language": "zh-CN,zh;q=0.9",
             "authorization": f"Bearer {auth_token}",
-            "origin": base_url,
-            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            # "origin": base_url,
+            # "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         }
         # 分片大小（由用户配置决定，不设上下限）
         self.chunk_size_mb = chunk_size_mb
