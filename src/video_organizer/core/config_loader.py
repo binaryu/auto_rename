@@ -27,7 +27,14 @@ DEFAULT_CONFIG = {
         "directory_metadata_format": "nfo",
         "directory_polling_interval": 5,
     },
-    "emos": {"auth_token": "", "base_url": "https://emos.lol"},
+    "emos": {
+        "auth_token": "",
+        "base_url": "https://emos.best",
+        "file_storage": "default",
+        "chunk_size_mb": 50,
+        "max_workers": 3,
+        "skip_existing_media": True,
+    },
     "p123": {
         "token": "",
         "username": "",
@@ -186,6 +193,31 @@ DEFAULT_CONFIG = {
 }
 
 
+def get_default_config_path() -> str:
+    if getattr(sys, "frozen", False):
+        base_dir = os.path.dirname(sys.executable)
+        return os.path.join(base_dir, "config.ini")
+    candidates = [
+        # 1. 当前工作目录下的 config.ini
+        os.path.abspath("config.ini"),
+        # 2. 项目根目录下的 config.ini (从 src/video_organizer/core 往上 3 级)
+        os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "..", "..", "config.ini")
+        ),
+        # 3. 旧版包内路径 (从 src/video_organizer/core 往上 1 级)
+        os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "config.ini")
+        ),
+    ]
+
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+
+    # 若均不存在，默认使用项目根目录路径
+    return candidates[1]
+
+
 def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
     """
     加载并验证配置文件
@@ -201,16 +233,7 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
         ValueError: 如果配置无效
     """
     if not config_path:
-        # 检查是否为打包后的环境
-        if getattr(sys, "frozen", False):
-            # 如果是打包后的exe，配置文件在exe同级目录
-            base_dir = os.path.dirname(sys.executable)
-            config_path = os.path.join(base_dir, "config.ini")
-        else:
-            # 开发环境：使用项目内配置文件路径
-            config_path = os.path.join(
-                os.path.dirname(os.path.dirname(__file__)), "config.ini"
-            )
+        config_path = get_default_config_path()
 
     # 检查配置文件是否存在
     if not os.path.exists(config_path):
@@ -446,15 +469,7 @@ def update_config(
         config_path: 配置文件路径
     """
     if not config_path:
-        # 检查是否为打包后的环境
-        if getattr(sys, "frozen", False):
-            # 如果是打包后的exe，配置文件在exe同级目录
-            base_dir = os.path.dirname(sys.executable)
-            config_path = os.path.join(base_dir, "config.ini")
-        else:
-            config_path = os.path.join(
-                os.path.dirname(os.path.dirname(__file__)), "config.ini"
-            )
+        config_path = get_default_config_path()
 
     config = configparser.ConfigParser()
 
