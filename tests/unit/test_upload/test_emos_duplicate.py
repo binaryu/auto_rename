@@ -107,13 +107,15 @@ class TestEmosDuplicateCheck(unittest.TestCase):
         )
         self.assertIsNone(res)
 
+    @patch.object(RobustEmosVideoUploader, "send_tg_notification")
     @patch.object(RobustEmosVideoUploader, "check_existing_media")
-    def test_upload_video_skip_when_duplicate(self, mock_check):
-        """测试 upload_video 开启 skip_existing_media 时直接返回跳过"""
+    def test_upload_video_skip_when_duplicate(self, mock_check, mock_send_tg):
+        """测试 upload_video 开启 skip_existing_media 时直接返回跳过并触发 TG 通知"""
         mock_check.return_value = {
             "media_id": "exist_uuid_123",
             "media_name": "Existing",
             "media_file_size": 1024,
+            "user_pseudonym": "TestUploader",
         }
 
         res = self.uploader.upload_video(
@@ -130,6 +132,8 @@ class TestEmosDuplicateCheck(unittest.TestCase):
         self.assertTrue(res.get("skipped"))
         self.assertEqual(res.get("media_uuid"), "exist_uuid_123")
         self.assertEqual(res.get("reason"), "duplicate_media_file_size")
+        mock_send_tg.assert_called_once()
+        self.assertIn("exist_uuid_123", mock_send_tg.call_args[0][0])
 
 
 if __name__ == "__main__":

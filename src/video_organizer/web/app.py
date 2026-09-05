@@ -52,11 +52,8 @@ def create_app(
     state = get_state_manager()
     if not state.get_config():
         try:
-            from ..core.config_loader import load_config
-            if getattr(sys, "frozen", False):
-                config_path = Path(sys.executable).parent / "config.ini"
-            else:
-                config_path = Path(__file__).resolve().parent.parent / "config.ini"
+            from ..core.config_loader import load_config, get_default_config_path
+            config_path = Path(get_default_config_path())
             if config_path.exists():
                 config = load_config(str(config_path))
                 state.set_config(config, config_path)

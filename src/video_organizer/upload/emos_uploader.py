@@ -10,6 +10,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import datetime
 import hashlib
+import html
 
 _logger = logging.getLogger(__name__)
 
@@ -418,6 +419,27 @@ class RobustEmosVideoUploader:
             print(f"TG 通知失败: {e}")
             pass
 
+    def send_tg_notification(self, message_text: str, parse_mode: str = "HTML"):
+        """发送 Telegram 普通通知消息 """
+        if not self.tg_bot_token or not self.tg_chat_id:
+            return
+        url = f"https://api.telegram.org/bot{self.tg_bot_token}/sendMessage"
+        data = {
+            "chat_id": self.tg_chat_id,
+            "text": message_text,
+            "parse_mode": parse_mode,
+            "disable_web_page_preview": True,
+        }
+        if self.telegram_config.get("thread_id"):
+            data["message_thread_id"] = self.telegram_config.get("thread_id")
+        try:
+            resp = requests.post(url, json=data, timeout=10)
+            if resp.status_code != 200:
+                data.pop("parse_mode", None)
+                requests.post(url, json=data, timeout=10)
+        except Exception as e:
+            print(f"TG 通知发送失败: {e}")
+
     def check_existing_media(
         self,
         file_path: Union[str, Path],
@@ -468,10 +490,15 @@ class RobustEmosVideoUploader:
                         for media in media_list:
                             if not isinstance(media, dict):
                                 continue
-                            # 场景1：比较文件精确字节数，且要求状态为完成 (complete)
-                            media_size = media.get("media_file_size")
-                            media_status = media.get("media_status")
-                            if media_status == "complete" and media_size == local_file_size:
+                            # 场景1：比较文件精确字节数（兼容字符串和整型），且要求状态为完成 (complete)
+                            raw_size = media.get("media_file_size")
+                            try:
+                                media_size = int(raw_size) if raw_size is not None else None
+                            except (ValueError, TypeError):
+                                media_size = None
+
+                            media_status = str(media.get("media_status") or "").strip().lower()
+                            if media_status in ("complete", "completed") and media_size == local_file_size:
                                 return media
                     return None
                 else:
@@ -1583,6 +1610,21 @@ class RobustEmosVideoUploader:
                         speed="existing size match",
                         status="completed",
                     )
+                    # 发送 Telegram 跳过通知（HTML格式避免文件名特殊字符导致解析崩溃）
+                    safe_name = html.escape(file_name)
+                    safe_media = html.escape(str(dup.get("media_name") or "未知"))
+                    safe_uploader = html.escape(str(uploader_name))
+                    safe_id = html.escape(str(dup.get("media_id") or ""))
+
+                    tg_msg = (
+                        f"⏸️ <b>[Emos] 检测到已有相同资源，跳过上传</b>\n\n"
+                        f"📁 <b>文件:</b> <code>{safe_name}</code>\n"
+                        f"📊 <b>大小:</b> {self._format_size(file_size)}\n"
+                        f"🎬 <b>已有媒体:</b> {safe_media}\n"
+                        f"🆔 <b>媒体ID:</b> <code>{safe_id}</code>\n"
+                        f"👤 <b>上传者:</b> {safe_uploader}"
+                    )
+                    self.send_tg_notification(tg_msg, parse_mode="HTML")
                     return {
                         "media_uuid": dup.get("media_id"),
                         "skipped": True,
