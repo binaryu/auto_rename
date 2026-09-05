@@ -173,6 +173,10 @@ class VideoFileHandler:
         self.emos_max_workers = int(
             self.emos_config.get("max_workers", 3)
         )  # 并发上传线程数，默认3
+        skip_existing = self.emos_config.get("skip_existing_media", True)
+        if isinstance(skip_existing, str):
+            skip_existing = skip_existing.lower() in ("true", "1", "yes")
+        self.emos_skip_existing_media = bool(skip_existing)
         self.max_upload_workers = int(
             self.processing_config.get("max_upload_workers", 1)
         )  # 并发上传数（全局默认）
@@ -1087,8 +1091,14 @@ class VideoFileHandler:
 
                 print(f"[线程#{worker_id}] Emos API 返回: {result2}")
 
+                emos_ids = None
                 # 解析返回结果（新版格式：直接包含 season_info 和 episode_info）
                 if result2:
+                    v_list_id = (
+                        result2.get("video_list_id")
+                        or result2.get("item_id")
+                        or result2.get("id")
+                    )
                     # 检查是否是电视剧
                     if result2.get("video_type") == "tv":
                         # 直接从返回结果中获取季集信息
@@ -1098,25 +1108,40 @@ class VideoFileHandler:
                         if season_info and episode_info:
                             matched_item_id = episode_info.get("item_id")
                             matched_item_type = episode_info.get("item_type")
+                            v_season_id = (
+                                season_info.get("video_season_id")
+                                or season_info.get("item_id")
+                                or season_info.get("id")
+                                or season_info.get("season_id")
+                            )
+                            v_episode_id = (
+                                episode_info.get("video_episode_id")
+                                or episode_info.get("item_id")
+                                or episode_info.get("id")
+                                or episode_info.get("episode_id")
+                            )
+                            emos_ids = {
+                                "video_list_id": v_list_id,
+                                "video_season_id": v_season_id,
+                                "video_episode_id": v_episode_id,
+                            }
                             print(
                                 f"[线程#{worker_id}] 剧集匹配成功！"
                                 f"item_id: {matched_item_id}, "
                                 f"item_type: {matched_item_type}, "
                                 f"集标题: {episode_info.get('episode_title')}"
                             )
-                        # elif result2.get("item_id"):
-                        #     # 如果没有 season_info/episode_info，资源有问题跳过
-                        #     # matched_item_id = result2.get("item_id")
-                        #     # matched_item_type = result2.get("item_type")
-                        #     print(
-                        #         f"[线程#{worker_id}] 使用顶层 item_id: {matched_item_id}"
-                        #     )
 
                     elif result2.get("video_type") == "movie" and result2.get(
                         "item_id"
                     ):
                         matched_item_id = result2.get("item_id")
                         matched_item_type = result2.get("item_type")
+                        emos_ids = {
+                            "video_list_id": v_list_id,
+                            "video_season_id": None,
+                            "video_episode_id": None,
+                        }
                         console_log(
                             f"[线程#{worker_id}] 电影匹配成功！item_id: {matched_item_id}"
                         )
@@ -1157,6 +1182,7 @@ class VideoFileHandler:
                     title,
                     season_episode,
                     metadata,
+                    emos_ids=emos_ids,
                 )
             else:
                 # 需要 Emos 但没有 item_id
@@ -1225,6 +1251,7 @@ class VideoFileHandler:
         title,
         season_episode,
         metadata,
+        emos_ids: Optional[Dict[str, Any]] = None,
     ):
         """执行具体的上传操作（支持多云盘）"""
         console_log(f"\n=== [线程#{worker_id}] 开始上传视频 ===")
@@ -1272,15 +1299,32 @@ class VideoFileHandler:
                             telegram_config=self.telegram_config,
                             max_workers=int(self.emos_max_workers),
                         )
+                        v_list_id = emos_ids.get("video_list_id") if emos_ids else None
+                        v_season_id = (
+                            emos_ids.get("video_season_id") if emos_ids else None
+                        )
+                        v_episode_id = (
+                            emos_ids.get("video_episode_id") if emos_ids else None
+                        )
+
                         upload_results["emos"] = uploader.upload_video(
                             file_path,
                             matched_item_type,
                             str(matched_item_id),
                             self.emos_file_storage,
+                            video_list_id=v_list_id,
+                            video_season_id=v_season_id,
+                            video_episode_id=v_episode_id,
+                            skip_existing_media=self.emos_skip_existing_media,
                         )
 
                         if upload_results["emos"]:
-                            console_log(f"\n🎉 [线程#{worker_id}] Emos上传成功!")
+                            if upload_results["emos"].get("skipped"):
+                                console_log(
+                                    f"\n⏸️ [线程#{worker_id}] Emos 检测到已存在完全相同大小的已完成资源，跳过上传并标记成功!"
+                                )
+                            else:
+                                console_log(f"\n🎉 [线程#{worker_id}] Emos上传成功!")
                         else:
                             console_log(f"\n❌ [线程#{worker_id}] Emos上传失败!")
                     except Exception as e:

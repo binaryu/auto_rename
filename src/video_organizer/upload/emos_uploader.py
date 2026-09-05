@@ -5,7 +5,7 @@ from pathlib import Path
 import math
 import time
 import logging
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Union
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import datetime
@@ -417,6 +417,73 @@ class RobustEmosVideoUploader:
             # TG 通知失败不影响主流程，静默处理
             print(f"TG 通知失败: {e}")
             pass
+
+    def check_existing_media(
+        self,
+        file_path: Union[str, Path],
+        video_list_id: Optional[Union[int, str]] = None,
+        video_season_id: Optional[Union[int, str]] = None,
+        video_episode_id: Optional[Union[int, str]] = None,
+        max_retries: int = 3,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        按场景1检查 Emos 平台是否已存在相同大小（字节数）且已完成的媒体资源。
+
+        Args:
+            file_path: 本地视频文件路径
+            video_list_id: 视频/电影主体 ID (video_list_id)
+            video_season_id: 季 ID (video_season_id)
+            video_episode_id: 集 ID (video_episode_id)
+            max_retries: 最大重试次数
+
+        Returns:
+            若检测到重复资源返回匹配的 media 字典，否则返回 None
+        """
+        file_path = Path(file_path)
+        if not file_path.exists():
+            return None
+
+        local_file_size = file_path.stat().st_size
+        url = f"{self.base_url}/api/video/media/list"
+        params: Dict[str, Any] = {}
+        if video_list_id is not None:
+            params["video_list_id"] = str(video_list_id)
+        if video_season_id is not None:
+            params["video_season_id"] = str(video_season_id)
+        if video_episode_id is not None:
+            params["video_episode_id"] = str(video_episode_id)
+
+        if not params:
+            print("⚠ 检查重复资源缺少 ID 参数，跳过排重检查")
+            return None
+
+        for attempt in range(max_retries):
+            try:
+                response = self.session.get(
+                    url, headers=self.headers, params=params, timeout=20
+                )
+                if response.status_code == 200:
+                    media_list = response.json()
+                    if isinstance(media_list, list):
+                        for media in media_list:
+                            if not isinstance(media, dict):
+                                continue
+                            # 场景1：比较文件精确字节数，且要求状态为完成 (complete)
+                            media_size = media.get("media_file_size")
+                            media_status = media.get("media_status")
+                            if media_status == "complete" and media_size == local_file_size:
+                                return media
+                    return None
+                else:
+                    print(f"检查 Emos 已有资源响应非200: {response.status_code}")
+                    if attempt < max_retries - 1:
+                        time.sleep(attempt + 1)
+            except Exception as e:
+                print(f"检查 Emos 已有资源异常 (尝试 {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(attempt + 1)
+
+        return None
 
     def step1_init_video(self, item_type, item_id, max_retries=3):
         """步骤1：初始化视频信息"""
@@ -1469,11 +1536,61 @@ class RobustEmosVideoUploader:
                     print(f"步骤4失败，已达到最大重试次数: {e}")
                     raise
 
-    def upload_video(self, file_path, item_type, item_id, file_storage="default", enable_resume=True):
-        """完整的上传流程（支持断点续传）"""
+    def upload_video(
+        self,
+        file_path,
+        item_type,
+        item_id,
+        file_storage="default",
+        enable_resume=True,
+        video_list_id=None,
+        video_season_id=None,
+        video_episode_id=None,
+        skip_existing_media=False,
+    ):
+        """完整的上传流程（支持断点续传与已有资源排重）"""
         file_path_obj = Path(file_path)
         file_size = file_path_obj.stat().st_size
         file_name = file_path_obj.name
+
+        # 检查是否开启已有资源排重（场景1：大小完全一致跳过）
+        if skip_existing_media:
+            try:
+                dup = self.check_existing_media(
+                    file_path=file_path_obj,
+                    video_list_id=video_list_id,
+                    video_season_id=video_season_id,
+                    video_episode_id=video_episode_id,
+                )
+                if dup:
+                    uploader_name = (
+                        dup.get("user_pseudonym") or dup.get("user_id") or "其他用户"
+                    )
+                    print(
+                        f"\n⏸️ 检测到 Emos 平台上已存在完全相同大小的媒体资源，跳过上传。"
+                    )
+                    print(f"   - 媒体ID: {dup.get('media_id')}")
+                    print(f"   - 媒体名称: {dup.get('media_name')}")
+                    print(f"   - 大小: {file_size} 字节")
+                    print(f"   - 上传者: {uploader_name}")
+                    _report_upload_progress(
+                        file_path=str(file_path_obj),
+                        filename=file_name,
+                        uploader="emos",
+                        progress=100,
+                        uploaded_bytes=file_size,
+                        total_bytes=file_size,
+                        speed="existing size match",
+                        status="completed",
+                    )
+                    return {
+                        "media_uuid": dup.get("media_id"),
+                        "skipped": True,
+                        "reason": "duplicate_media_file_size",
+                        "existing_media": dup,
+                    }
+            except Exception as e:
+                print(f"排重检查异常，继续执行上传: {e}")
 
         # 报告上传开始
         _report_upload_progress(

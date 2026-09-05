@@ -27,7 +27,14 @@ DEFAULT_CONFIG = {
         "directory_metadata_format": "nfo",
         "directory_polling_interval": 5,
     },
-    "emos": {"auth_token": "", "base_url": "https://emos.lol"},
+    "emos": {
+        "auth_token": "",
+        "base_url": "https://emos.best",
+        "file_storage": "default",
+        "chunk_size_mb": 50,
+        "max_workers": 3,
+        "skip_existing_media": True,
+    },
     "p123": {
         "token": "",
         "username": "",
