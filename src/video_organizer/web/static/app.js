@@ -17,7 +17,8 @@ const state = {
     selectedFiles: [],
     organizeProvider: 'p123',
     organizePollTimer: null,
-    organizeIdsByProvider: {}
+    organizeIdsByProvider: {},
+    recycleBusy: {}
 };
 
 const el = {};
@@ -150,6 +151,11 @@ function cacheElements() {
     el.organizeResultSkipped = document.getElementById('organizeResultSkipped');
     el.organizeResultTotal = document.getElementById('organizeResultTotal');
     el.organizeErrors = document.getElementById('organizeErrors');
+    el.recycleEnabledBadge = document.getElementById('recycleEnabledBadge');
+    el.recycleRefreshBtn = document.getElementById('recycleRefreshBtn');
+    el.recycleScheduleText = document.getElementById('recycleScheduleText');
+    el.recycleTableBody = document.getElementById('recycleTableBody');
+    el.recycleLastResult = document.getElementById('recycleLastResult');
 }
 
 function bindEvents() {
@@ -189,6 +195,16 @@ function bindEvents() {
     el.organizePreviewBtn.addEventListener('click', () => runOrganize(true));
     el.organizeStartBtn.addEventListener('click', () => runOrganize(false));
     el.organizeCancelBtn.addEventListener('click', cancelOrganize);
+    if (el.recycleRefreshBtn) el.recycleRefreshBtn.addEventListener('click', loadRecycleStatus);
+    if (el.recycleTableBody) el.recycleTableBody.addEventListener('click', (e) => {
+        const btn = e.target.closest('button[data-action]');
+        if (!btn || btn.disabled) return;
+        const provider = btn.dataset.provider;
+        const action = btn.dataset.action;
+        if (action === 'stats') refreshRecycleStats(provider);
+        else if (action === 'dry') runRecycleClean(provider, true);
+        else if (action === 'clear') confirmRecycleClean(provider);
+    });
     el.modalClose.addEventListener('click', hideModal);
     el.modalCancelBtn.addEventListener('click', hideModal);
     el.modalOverlay.addEventListener('click', (e) => {
@@ -282,7 +298,7 @@ function switchPage(pageName) {
     if (sidebar) sidebar.classList.remove('show');
     if (pageName === 'downloaders') loadDownloaderConfigs();
     if (pageName === 'users') { loadUsers(); loadApiKeys(); }
-    if (pageName === 'organize') loadOrganizeStatus();
+    if (pageName === 'organize') { loadOrganizeStatus(); loadRecycleStatus(); }
 }
 
 function switchTaskTab(tabName) {
@@ -601,6 +617,7 @@ function getSectionLabel(section) {
         'monitoring': '监控配置', 'tmdb': 'TMDB 配置', 'naming': '命名规则',
         'processing': '处理配置', 'logging': '日志配置',
         'p123': '123云盘', 'cloud189': '天翼云盘', 'yun139': '139云盘',
+        'recycle_clean': '回收站清理',
         'emos': 'Emby 云盘', 'telegram': 'Telegram', 'guessit': 'GuessIt 解析',
         'emya_db': 'Emby 数据库', 'downloaders': '下载器列表',
     };
@@ -2086,5 +2103,138 @@ async function pollOrganizeProgress() {
     } else {
         setOrganizeStatusBadge('运行中', 'badge-info');
         el.organizeCancelBtn.disabled = false;
+    }
+}
+
+
+// ===== 回收站清理 =====
+const RECYCLE_PROVIDER_LABELS = { p123: '123云盘', yun139: '139云盘', cloud189: '天翼云盘' };
+
+async function loadRecycleStatus() {
+    if (!el.recycleTableBody) return;
+    try {
+        const data = await loadRecycleStatusFromApi();
+        renderRecycleStatus(data);
+        (data.providers || []).forEach(p => refreshRecycleStats(p.name));
+    } catch (e) {
+        el.recycleTableBody.innerHTML = '<tr><td colspan="4" style="color:var(--red)">加载失败: ' + escapeHtml(e.message) + '</td></tr>';
+    }
+}
+
+function renderRecycleStatus(data) {
+    const c = data.cleaner || {};
+    const enabled = !!c.enabled;
+    if (el.recycleEnabledBadge) {
+        el.recycleEnabledBadge.textContent = enabled ? (c.thread_alive ? '定时运行中' : '定时已启用') : '定时未启用';
+        el.recycleEnabledBadge.className = 'badge ' + (enabled ? 'badge-success' : 'badge-warning');
+    }
+    if (el.recycleScheduleText) {
+        const slots = (c.daily_at || []).join('、') || '-';
+        const targets = (c.providers || []).map(n => RECYCLE_PROVIDER_LABELS[n] || n).join('、') || '-';
+        let text = `定时策略：每日 ${slots} 清空 ${targets} 回收站（清空后不可恢复）`;
+        if (enabled && c.next_run_at) text += ` · 下次执行 ${c.next_run_at.replace('T', ' ')}`;
+        text += ' · 修改请到「配置管理 → 回收站清理」';
+        el.recycleScheduleText.textContent = text;
+    }
+    if (el.recycleLastResult) {
+        const results = c.last_results || [];
+        el.recycleLastResult.textContent = c.last_run_at
+            ? `上次执行 ${c.last_run_at.replace('T', ' ')}：` + results.map(r => `${RECYCLE_PROVIDER_LABELS[r.provider] || r.provider} ${r.message || '无变更'}`).join('；')
+            : '本进程尚未执行过清理';
+    }
+    const providers = data.providers || [];
+    if (!providers.length) {
+        el.recycleTableBody.innerHTML = '<tr><td colspan="4" style="color:var(--text-muted)">暂无可用的回收站 Provider</td></tr>';
+        return;
+    }
+    el.recycleTableBody.innerHTML = providers.map(p => {
+        const label = RECYCLE_PROVIDER_LABELS[p.name] || p.label || p.name;
+        const disabled = p.available ? '' : ' disabled';
+        return `<tr>
+            <td>${escapeHtml(label)}</td>
+            <td id="recycle-count-${escapeHtml(p.name)}" style="color:var(--text-muted)">—</td>
+            <td id="recycle-size-${escapeHtml(p.name)}" style="color:var(--text-muted)">—</td>
+            <td>
+                <div style="display:flex;gap:8px;flex-wrap:wrap">
+                    <button class="btn btn-secondary btn-sm" data-action="stats" data-provider="${escapeHtml(p.name)}">查询</button>
+                    <button class="btn btn-secondary btn-sm" data-action="dry" data-provider="${escapeHtml(p.name)}"${disabled}>试运行</button>
+                    <button class="btn btn-danger btn-sm" data-action="clear" data-provider="${escapeHtml(p.name)}"${disabled}>清空回收站</button>
+                </div>
+            </td>
+        </tr>`;
+    }).join('');
+}
+
+async function refreshRecycleStats(provider) {
+    const countCell = document.getElementById('recycle-count-' + provider);
+    const sizeCell = document.getElementById('recycle-size-' + provider);
+    if (!countCell || !sizeCell) return;
+    countCell.textContent = '查询中...';
+    countCell.style.color = 'var(--text-muted)';
+    sizeCell.textContent = '—';
+    try {
+        const r = await loadRecycleStatsFromApi(provider);
+        const s = r.stats || {};
+        if (!s.available) {
+            countCell.textContent = '未配置';
+            sizeCell.textContent = s.error || '—';
+            return;
+        }
+        if (s.error) {
+            countCell.textContent = '查询失败';
+            countCell.style.color = 'var(--red)';
+            sizeCell.textContent = s.error;
+            return;
+        }
+        countCell.textContent = `${s.count}${s.truncated ? '+' : ''} 项`;
+        countCell.style.color = s.count > 0 ? 'var(--text)' : 'var(--text-muted)';
+        sizeCell.textContent = formatSize(s.size || 0);
+    } catch (e) {
+        countCell.textContent = '查询失败';
+        countCell.style.color = 'var(--red)';
+        sizeCell.textContent = e.message;
+    }
+}
+
+function setRecycleButtonsBusy(provider, busy) {
+    document.querySelectorAll(`#recycleTableBody button[data-provider="${provider}"]`).forEach(b => {
+        b.disabled = busy;
+    });
+}
+
+function confirmRecycleClean(provider) {
+    const label = RECYCLE_PROVIDER_LABELS[provider] || provider;
+    showConfirm(
+        '确认清空回收站',
+        `${label} 回收站将被彻底删除且不可恢复，是否继续？`,
+        () => runRecycleClean(provider, false),
+        '确认清空'
+    );
+}
+
+async function runRecycleClean(provider, dryRun) {
+    if (state.recycleBusy[provider]) {
+        showToast('该网盘回收站清理正在进行中', 'info');
+        return;
+    }
+    const label = RECYCLE_PROVIDER_LABELS[provider] || provider;
+    state.recycleBusy[provider] = true;
+    setRecycleButtonsBusy(provider, true);
+    try {
+        const r = await runRecycleCleanViaApi(provider, dryRun);
+        const res = r.result || {};
+        const ok = !!r.success;
+        const prefix = dryRun ? '试运行' : '清空';
+        if (!ok && res.skipped) showToast(`${label} ${prefix}未执行: ${res.message || ''}`, 'error');
+        else showToast(`${label} ${prefix}：${res.message || '完成'}`, ok ? 'success' : 'error');
+        if (el.recycleLastResult) {
+            el.recycleLastResult.textContent = `上次执行 ${res.finished_at ? res.finished_at.replace('T', ' ') : ''}：${label} ${res.message || ''}`;
+        }
+        refreshRecycleStats(provider);
+    } catch (e) {
+        showToast(`${label} 清理失败: ` + e.message, 'error');
+    } finally {
+        state.recycleBusy[provider] = false;
+        setRecycleButtonsBusy(provider, false);
     }
 }

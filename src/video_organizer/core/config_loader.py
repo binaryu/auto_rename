@@ -44,6 +44,22 @@ DEFAULT_CONFIG = {
         "organize_source_id": 0,
         "organize_target_id": 0,
     },
+    "recycle_clean": {
+        # 是否启用网盘回收站定时清理
+        "enabled": False,
+        # 要清理的网盘，逗号分隔（当前已支持 p123）
+        "providers": ["p123"],
+        # 每天执行的时间点，HH:MM，可用逗号配置多个，例如 "04:00,16:00"
+        "daily_at": "04:00",
+        # 启动时若当天时间点已过且未执行过，补跑一次
+        "catch_up_on_start": True,
+        # 启动后立即执行一次（调试用）
+        "run_on_start": False,
+        # 清理结果推送 Telegram 通知
+        "notify_telegram": True,
+        # 统计回收站时最多遍历的条目数，防止超大回收站拖慢
+        "max_items": 5000,
+    },
     "cloud189": {
         "username": "",
         "password": "",
@@ -205,9 +221,7 @@ def get_default_config_path() -> str:
             os.path.join(os.path.dirname(__file__), "..", "..", "..", "config.ini")
         ),
         # 3. 旧版包内路径 (从 src/video_organizer/core 往上 1 级)
-        os.path.abspath(
-            os.path.join(os.path.dirname(__file__), "..", "config.ini")
-        ),
+        os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "config.ini")),
     ]
 
     for p in candidates:

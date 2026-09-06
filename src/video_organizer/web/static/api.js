@@ -317,3 +317,20 @@ async function cancelOrganizeViaApi(provider) {
 async function loadOrganizeProgressFromApi(provider) {
     return await apiRequest(`/organize/${provider}/progress`);
 }
+
+// ===== 回收站清理 API =====
+
+async function loadRecycleStatusFromApi() {
+    return await apiRequest('/recycle/status');
+}
+
+async function loadRecycleStatsFromApi(provider) {
+    return await apiRequest(`/recycle/${provider}/stats`);
+}
+
+async function runRecycleCleanViaApi(provider, dryRun) {
+    return await apiRequest(`/recycle/${provider}/run`, {
+        method: 'POST',
+        body: JSON.stringify({ dry_run: dryRun })
+    });
+}

@@ -341,6 +341,11 @@
                                 <span class="cnav-label">139云盘</span>
                                 <span class="cnav-badge">—</span>
                             </a>
+                            <a class="cnav-item" data-section="recycle_clean">
+                                <span class="cnav-led"></span>
+                                <span class="cnav-label">回收站清理</span>
+                                <span class="cnav-badge">—</span>
+                            </a>
                             <a class="cnav-item" data-section="emos">
                                 <span class="cnav-led"></span>
                                 <span class="cnav-label">Emby 云盘</span>
@@ -572,6 +577,25 @@
                         </table>
                     </div>
                     <div id="organizeErrors" style="margin-top:12px;font-size:0.8125rem;color:var(--red)"></div>
+                </div>
+
+                <!-- 回收站清理 -->
+                <div class="card">
+                    <div class="card-header">
+                        <h3 class="card-title">回收站清理</h3>
+                        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+                            <span class="badge" id="recycleEnabledBadge">未启用</span>
+                            <button class="btn btn-secondary btn-sm" id="recycleRefreshBtn">刷新</button>
+                        </div>
+                    </div>
+                    <div id="recycleScheduleText" style="font-size:0.8125rem;color:var(--text-muted);margin-bottom:12px">网盘删除的文件会进入回收站并继续占用容量，需定时彻底清空才会释放</div>
+                    <div class="table-container">
+                        <table>
+                            <thead><tr><th>网盘</th><th>回收站条目</th><th>占用空间</th><th>操作</th></tr></thead>
+                            <tbody id="recycleTableBody"><tr><td colspan="4" style="color:var(--text-muted)">加载中...</td></tr></tbody>
+                        </table>
+                    </div>
+                    <div id="recycleLastResult" style="margin-top:12px;font-size:0.8125rem;color:var(--text-muted)"></div>
                 </div>
             </div>
 

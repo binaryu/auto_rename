@@ -9,6 +9,7 @@ from .auth import router as auth_router
 from .apikeys import router as apikeys_router
 from .strm import router as strm_router
 from .organize import router as organize_router
+from .recycle import router as recycle_router
 
 __all__ = [
     "config_router",
@@ -20,4 +21,5 @@ __all__ = [
     "apikeys_router",
     "strm_router",
     "organize_router",
+    "recycle_router",
 ]

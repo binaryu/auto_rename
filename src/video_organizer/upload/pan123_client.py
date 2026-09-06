@@ -15,7 +15,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 import requests
@@ -42,6 +42,10 @@ UPLOAD_COMPLETE_V2 = f"{MAIN_API}/file/upload_complete/v2"
 MOVE = f"{MAIN_API}/file/mod_pid"
 RENAME = f"{MAIN_API}/file/rename"
 TRASH = f"{MAIN_API}/file/trash"
+# 彻底删除（对象必须已经在回收站中）
+FILE_DELETE = f"{MAIN_API}/file/delete"
+# 清空回收站
+TRASH_DELETE_ALL = f"{MAIN_API}/file/trash_delete_all"
 
 
 # ========== 签名工具（OpenList GetApi/signPath 翻译） ==========
@@ -148,7 +152,9 @@ def calculate_md5(file_path: str) -> str:
     file_size = Path(file_path).stat().st_size
     hash_md5 = hashlib.md5()
     with open(file_path, "rb") as f:
-        with tqdm(total=file_size, unit='B', unit_scale=True, desc="MD5", ncols=80) as pbar:
+        with tqdm(
+            total=file_size, unit="B", unit_scale=True, desc="MD5", ncols=80
+        ) as pbar:
             for chunk in iter(lambda: f.read(1024 * 1024), b""):
                 hash_md5.update(chunk)
                 pbar.update(len(chunk))
@@ -274,7 +280,9 @@ class Pan123Client:
         with _GLOBAL_LOGIN_LOCK:
             wait = _login_cooldown - (time.time() - _last_login_at)
             if wait > 0:
-                logger.info(f"123 登录进入冷却期，{wait:.0f}s 后重试（避免触发人机验证）")
+                logger.info(
+                    f"123 登录进入冷却期，{wait:.0f}s 后重试（避免触发人机验证）"
+                )
                 return False
             body: Dict[str, Any]
             if re.match(r"^[^@]+@[^@]+\.[^@]+$", self.username):
@@ -302,9 +310,7 @@ class Pan123Client:
                 if data.get("code") == 200:
                     self.token = data["data"]["token"]
                     self.expire = _parse_expire(data["data"].get("expire"))
-                    self._session.headers["authorization"] = (
-                        f"Bearer {self.token}"
-                    )
+                    self._session.headers["authorization"] = f"Bearer {self.token}"
                     self._save_token()
                     logger.info("123云盘登录成功")
                     return True
@@ -398,7 +404,9 @@ class Pan123Client:
             "parentFileId": str(
                 data.get("parentFileId", data.get("parent_file_id", 0))
             ),
-            "trashed": "false",
+            "next": str(data.get("next", 0)),
+            # trashed=true + event=recycleListFile 即为回收站列表
+            "trashed": "true" if data.get("trashed") else "false",
             "Page": str(data.get("page", data.get("Page", 1))),
             "event": data.get("event", "homeListFile"),
         }
@@ -529,6 +537,106 @@ class Pan123Client:
             },
         )
 
+    # ----- 回收站 -----
+
+    def recycle_list(self, limit: int = 100, next_cursor: int = 0) -> Dict[str, Any]:
+        """列出回收站文件（游标分页，响应中的 Next 为下一页游标，"-1" 表示末页）
+
+        注意：123 接口在 orderDirection=desc 时会返回空列表，因此固定使用 asc。
+        """
+        return self.fs_list(
+            {
+                "driveId": 0,
+                "parentFileId": 0,
+                "limit": limit,
+                "next": next_cursor,
+                "orderBy": "file_id",
+                "orderDirection": "asc",
+                "page": 1,
+                "trashed": True,
+                "event": "recycleListFile",
+            }
+        )
+
+    def iter_recycle(
+        self, limit: int = 100, max_items: int = 0
+    ) -> Iterator[Dict[str, Any]]:
+        """遍历回收站文件，自动翻页
+
+        Args:
+            limit: 每页条数（最大 100）
+            max_items: 最多产出多少条，0 表示不限制
+        """
+        cursor = 0
+        seen = 0
+        while True:
+            resp = self.recycle_list(limit=limit, next_cursor=cursor)
+            if resp.get("code") != 0:
+                logger.warning(f"读取回收站列表失败: {resp.get('message')}")
+                return
+            data = resp.get("data") or {}
+            items = data.get("InfoList") or []
+            if not items:
+                return
+            for item in items:
+                yield item
+                seen += 1
+                if max_items and seen >= max_items:
+                    return
+            nxt = str(data.get("Next", "-1") or "-1")
+            if not nxt.isdigit():
+                # Next == "-1" 或异常值均视为遍历结束
+                return
+            cursor = int(nxt)
+
+    def recycle_stats(self, max_items: int = 5000) -> Dict[str, Any]:
+        """统计回收站条目数量与占用空间
+
+        Returns:
+            {"count": 条目数, "size": 字节数, "truncated": 是否因 max_items 提前结束}
+        """
+        count = 0
+        size = 0
+        for item in self.iter_recycle(max_items=max_items):
+            count += 1
+            try:
+                size += int(item.get("Size") or item.get("FileSize") or 0)
+            except (TypeError, ValueError):
+                pass
+        return {"count": count, "size": size, "truncated": count >= max_items}
+
+    def recycle_delete(self, file_ids: Iterable) -> Dict[str, Any]:
+        """彻底删除回收站中的指定文件（文件必须已经在回收站中）"""
+        return self.request(
+            FILE_DELETE,
+            "POST",
+            json_data={
+                "fileIdList": [{"FileId": fid} for fid in file_ids],
+                "event": "recycleDelete",
+            },
+        )
+
+    def recycle_clear(self) -> Dict[str, Any]:
+        """清空回收站（彻底删除全部文件，不可恢复）"""
+        return self.request(
+            TRASH_DELETE_ALL,
+            "POST",
+            json_data={"event": "recycleClear"},
+        )
+
+    def recycle_restore(self, file_id) -> Dict[str, Any]:
+        """从回收站还原文件"""
+        return self.request(
+            TRASH,
+            "POST",
+            json_data={
+                "driveId": 0,
+                "event": "recycleRestore",
+                "operation": False,
+                "fileTrashInfoList": [{"FileId": file_id}],
+            },
+        )
+
     def get_download_info(self, file: Dict[str, Any]) -> Optional[str]:
         data = {
             "driveId": 0,
@@ -540,7 +648,9 @@ class Pan123Client:
             "type": file.get("type", file.get("Type", 0)),
         }
         resp = self.request(DOWNLOAD_INFO, "POST", json_data=data)
-        logger.info(f"123 get_download_info 响应: code={resp.get('code')}, data={resp.get('data')}")
+        logger.info(
+            f"123 get_download_info 响应: code={resp.get('code')}, data={resp.get('data')}"
+        )
         if resp.get("code") == 0:
             du = resp.get("data", {}).get("DownloadUrl", "")
             if not du:
@@ -565,9 +675,7 @@ class Pan123Client:
                 j = r.json()
                 redirect_url = j.get("data", {}).get("redirect_url")
                 if redirect_url:
-                    logger.info(
-                        f"123 解析到最终直链: {redirect_url[:100]}..."
-                    )
+                    logger.info(f"123 解析到最终直链: {redirect_url[:100]}...")
                     return redirect_url
         except Exception:
             pass
@@ -725,7 +833,9 @@ def upload_file(
                 "name": target_name,
                 "size": file_size,
                 "etag": file_md5,
-                "fileid": str(data.get("FileId") or data.get("Info", {}).get("FileId", "")),
+                "fileid": str(
+                    data.get("FileId") or data.get("Info", {}).get("FileId", "")
+                ),
                 "modify_time": int(datetime.now().timestamp()),
                 "upload_time": upload_time,
                 "avg_speed": avg_speed,

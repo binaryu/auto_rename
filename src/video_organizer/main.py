@@ -384,6 +384,52 @@ def display_config(config: dict) -> None:
     cli_output.print_separator()
 
 
+def initialize_recycle_cleaner(
+    config: Dict[str, Any], video_handler: Optional[Any] = None
+) -> Optional[Any]:
+    """
+    初始化并启动网盘回收站定时清理器
+
+    即使未启用也会注册为全局单例，以便 Web 端查看配置与手动触发清理。
+
+    Args:
+        config: 完整配置字典
+        video_handler: 视频处理器，用于复用已登录的云盘客户端（避免重复登录）
+
+    Returns:
+        RecycleCleaner 实例，初始化失败时返回 None
+    """
+    app_logger = get_logger(__name__)
+    try:
+        from .core.recycle_cleaner import (
+            P123RecycleProvider,
+            RecycleCleaner,
+            set_cleaner,
+        )
+
+        cleaner = RecycleCleaner(config)
+
+        # 复用上传器已有的 123 客户端
+        uploader = (
+            getattr(video_handler, "p123_uploader", None) if video_handler else None
+        )
+        if uploader is not None and getattr(uploader, "client", None) is not None:
+            cleaner.use_provider(
+                "p123", P123RecycleProvider(config, client=uploader.client)
+            )
+
+        set_cleaner(cleaner)
+        if cleaner.start():
+            slots = ",".join(cleaner.get_status()["daily_at"])
+            cli_output.print_info(
+                f"网盘回收站定时清理已启用：每日 {slots}（providers={','.join(cleaner.provider_names)}）"
+            )
+        return cleaner
+    except Exception as e:
+        app_logger.warning(f"初始化回收站清理器失败: {e}")
+        return None
+
+
 def start_web_server(
     host: str,
     port: int,
@@ -701,6 +747,9 @@ def main() -> None:
                 except Exception as e:
                     cli_output.print_warning(f"139云盘客户端初始化失败: {e}")
 
+            # 初始化回收站定时清理器（仅 Web 模式下也需要能手动/定时清理）
+            recycle_cleaner = initialize_recycle_cleaner(config)
+
             # 启动 Web 服务（主线程运行）
             try:
                 from .web.app import create_app
@@ -725,6 +774,9 @@ def main() -> None:
                     "Web 服务依赖缺失，请安装: pip install fastapi uvicorn"
                 )
                 sys.exit(1)
+            finally:
+                if recycle_cleaner:
+                    recycle_cleaner.stop()
             sys.exit(0)
 
         # 初始化监控器
@@ -732,6 +784,11 @@ def main() -> None:
         if not monitor:
             cli_output.print_error("监控器初始化失败，程序退出")
             sys.exit(1)
+
+        # 初始化回收站定时清理器（复用监控器已登录的云盘客户端）
+        recycle_cleaner = initialize_recycle_cleaner(
+            config, getattr(monitor, "event_handler", None)
+        )
 
         # 启动 Web 服务（如果请求）
         web_thread = None
@@ -823,6 +880,14 @@ def main() -> None:
                     logger.info("Media Tracker 客户端已停止")
                 except Exception as e:
                     logger.warning(f"停止 Media Tracker 客户端时出错: {e}")
+
+            # 停止回收站定时清理器
+            if recycle_cleaner:
+                try:
+                    recycle_cleaner.stop()
+                    logger.info("回收站定时清理器已停止")
+                except Exception as e:
+                    logger.warning(f"停止回收站清理器时出错: {e}")
 
     except ValueError as e:
         # 处理配置验证错误

@@ -450,6 +450,42 @@ async def yun139_create_get_download_url(
 # ==================== 123 云盘秒传代理 ====================
 
 
+def _p123_trash_temp(client, file_id, file_name: str) -> bool:
+    """把秒传产生的临时文件移入回收站
+
+    ``Pan123Client.request()`` 在接口返回非 0 code 时只记 error 日志、不抛异常，
+    因此必须检查返回值；否则文件会静默残留在网盘目录里（不在回收站，
+    定时清理也盖不到），且没有任何可用日志。
+
+    Args:
+        client: Pan123Client 实例
+        file_id: 临时文件 FileId
+        file_name: 文件名，仅用于残留告警日志
+
+    Returns:
+        是否删除成功
+    """
+    message = ""
+    for attempt in (1, 2):
+        try:
+            resp = client.fs_trash(int(file_id))
+        except Exception as exc:
+            resp = {"code": -1, "message": str(exc)}
+        if resp.get("code") in (0, 200):
+            return True
+        message = str(resp.get("message") or "")
+        logger.warning(
+            f"删除 123 秒传临时文件失败（第 {attempt} 次）: FileId={file_id}, {message}"
+        )
+        if attempt == 1:
+            time.sleep(0.5)
+    logger.error(
+        f"⚠️ 123 秒传临时文件残留: FileId={file_id}, 文件名={file_name}，"
+        f"已跳出回收站清理范围，需手动删除"
+    )
+    return False
+
+
 def _p123_handle_redirect(
     file_size: int,
     etag: str,
@@ -535,20 +571,20 @@ def _p123_handle_redirect(
         download_url = client.get_download_info(file_info)
     except Exception as e:
         logger.error(f"获取直链异常: {e}", exc_info=True)
+        # 取不到直链也要清理，否则临时文件残留在网盘目录中
+        _p123_trash_temp(client, file_id, decoded_name)
         return JSONResponse(status_code=500, content={"error": f"获取直链异常: {e}"})
 
     if not download_url:
+        _p123_trash_temp(client, file_id, decoded_name)
         return JSONResponse(status_code=500, content={"error": "获取直链失败"})
 
     logger.info(
         f"123 秒传成功，文件: {decoded_name}, FileID: {file_id}, 直链: {download_url[:100]}..."
     )
 
-    # 删除临时文件
-    try:
-        client.fs_trash(int(file_id))
-    except Exception as e:
-        logger.warning(f"删除 123 临时文件失败: {e}")
+    # 删除临时文件（失败不影响已拿到的直链，但必须记日志）
+    _p123_trash_temp(client, file_id, decoded_name)
 
     # 缓存 1 小时 + 302
     _cache_set(key, download_url, 3600)

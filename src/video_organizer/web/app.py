@@ -26,6 +26,7 @@ from .routers import (
     apikeys_router,
     strm_router,
     organize_router,
+    recycle_router,
 )
 from .auth import auth_middleware
 from ..database.config_operations import seed_from_ini
@@ -100,6 +101,7 @@ def create_app(
     app.include_router(downloaders_router, prefix="/api/downloaders", tags=["下载器监控"])
     app.include_router(strm_router, tags=["STRM 代理"])
     app.include_router(organize_router, prefix="/api/organize", tags=["网盘整理"])
+    app.include_router(recycle_router, prefix="/api/recycle", tags=["回收站清理"])
     
     # 认证中间件（对 API 请求进行登录检查）
     app.middleware("http")(auth_middleware)
