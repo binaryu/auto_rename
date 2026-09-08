@@ -728,6 +728,9 @@ class TMDBClient:
             "Cookie": TMDB_WEB_COOKIE,
         }
         req = urllib.request.Request(url, headers=headers)
+        # 网站搜索不走 API 网关，但同样消耗 TMDB 服务器额度；
+        # 必须走进程级全局限速器，否则多实例并发时网站搜索会互相打爆 429
+        _global_rate_limiter.acquire()
         try:
             html = urllib.request.urlopen(req, timeout=15).read().decode(
                 "utf-8", "ignore"

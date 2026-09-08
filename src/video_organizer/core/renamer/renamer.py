@@ -6,6 +6,7 @@ import os
 import re
 import logging
 import threading
+import time
 import urllib.parse
 from pathlib import Path
 from typing import Dict, List, Optional, Union, Set
@@ -14,6 +15,11 @@ from jinja2 import Template
 from ..tmdb_client import TMDBClient
 from ..guessit_parser import GuessItParser, GUESSIT_AVAILABLE
 from ...utils.llm_translator import LLMTranslator
+from ...utils.cache import ThreadSafeLRUCache
+
+# 搜索空结果的短时缓存时长（秒）：识别失败的搜索词短时间内不会变，
+# 避免同词被多个文件反复重试打爆 TMDB 限速；到期后自动失效可重试
+_SEARCH_EMPTY_TTL = 600
 from ..manual_rule_engine import ManualRuleEngine
 from ..media_type_resolver import MediaTypeResolver
 
@@ -60,6 +66,33 @@ def decode_filename(filename: str) -> str:
 
 class VideoRenamer:
     """Extracts metadata from video files and generates organized paths."""
+
+    # ==================== 进程级共享缓存（类属性） ====================
+    # 同一进程内可能同时存在多个 VideoRenamer 实例（监控 handler / Web 手动验证 /
+    # 网盘整理 / emya 入库）。若缓存是实例级，每个实例都会各自请求 TMDB/LLM；
+    # 典型反例：/api/manual/validate 每次请求都 new 一个实例，同一目录多集并发
+    # 验证时缓存完全不共享，single-flight 也失效，每集都会重复调用 LLM。
+    # 因此全部缓存提升为类属性（进程内共享），配合线程安全 LRU 容器与
+    # single-flight 合并（get_or_create / _llm_inflight），保证同 key 只发一次请求。
+    _tmdb_cache: ThreadSafeLRUCache = ThreadSafeLRUCache(maxsize=2000)
+    # 缓存键到 tmdb_id 的映射（用于同一剧集不同集数的快速查找）
+    _tmdb_name_to_id: ThreadSafeLRUCache = ThreadSafeLRUCache(maxsize=5000)
+    # TMDB 搜索结果缓存：避免重复搜索
+    _search_cache: ThreadSafeLRUCache = ThreadSafeLRUCache(maxsize=2000)
+    # 季后验年份匹配缓存：避免同一剧集重复请求
+    _season_year_boost_cache: ThreadSafeLRUCache = ThreadSafeLRUCache(maxsize=2000)
+    # 模糊类型判定缓存：避免批量处理时重复请求
+    _type_resolve_cache: ThreadSafeLRUCache = ThreadSafeLRUCache(maxsize=2000)
+    # LLM 文件名解析缓存：同一目录的多集（如 "剧名（2026）/01.mp4"、"02.mp4"）
+    # 解析出的剧名相同，按「父目录 + 原始剧名」缓存，避免每集重复调用 LLM
+    _llm_parse_cache: ThreadSafeLRUCache = ThreadSafeLRUCache(maxsize=2000)
+    # 在途的 LLM 解析请求（single-flight）：同 key 的并发请求复用首个结果
+    _llm_inflight: Dict[tuple, threading.Event] = {}
+    _llm_cache_lock = threading.Lock()
+    # 搜索空结果的写入时间戳（配合 _SEARCH_EMPTY_TTL 做短时负缓存）
+    _search_empty_ttl: Dict[tuple, float] = {}
+    # 按年份反推季号的缓存：(tmdb_id, year) -> 季号或 None（None 也缓存防重复查详情）
+    _season_infer_cache: ThreadSafeLRUCache = ThreadSafeLRUCache(maxsize=2000)
 
     # 默认命名规则模板
     DEFAULT_NAMING_RULES = {
@@ -346,7 +379,15 @@ class VideoRenamer:
         self.llm_translator = None
         self._llm_semaphore = threading.Semaphore(2)
         self._llm_fallback_enabled = False
+        # 等待并发同类 LLM 请求的最长时间（秒），同时用作信号量排队超时
+        self._llm_wait_timeout = 60
         llm_fallback_config = config.get("llm_fallback", {}) if config and isinstance(config, dict) else {}
+        try:
+            self._llm_wait_timeout = int(
+                llm_fallback_config.get("llm_wait_timeout", 60) or 60
+            )
+        except (TypeError, ValueError):
+            self._llm_wait_timeout = 60
         if llm_fallback_config.get("enabled", False):
             # 收集所有启用的 Provider
             providers = []
@@ -414,16 +455,13 @@ class VideoRenamer:
 
         # TMDB 缓存：避免同一剧集的每一集都重复请求 TMDB
         # 缓存键: show_name (或 tmdb_id)，值: 完整的元数据
-        self._tmdb_cache: Dict[str, Dict] = {}
-        # 缓存键到 tmdb_id 的映射（用于同一剧集不同集数的快速查找）
-        self._tmdb_name_to_id: Dict[str, int] = {}
-        # TMDB 搜索结果缓存：避免重复搜索
-        self._search_cache: Dict[str, List] = {}
-        # 季后验年份匹配缓存：避免同一剧集重复请求
-        self._season_year_boost_cache: Dict[tuple, int] = {}
-        # 模糊类型判定缓存：避免批量处理时重复请求
-        self._type_resolve_cache: Dict[tuple, Optional[str]] = {}
-        logger.info("VideoRenamer: TMDB 缓存已初始化")
+        # 全部使用带容量上限的线程安全 LRU 容器：
+        # - 防长跑内存膨胀（超限自动淘汰最久未使用条目）
+        # - 多 worker 并发处理文件时读写原子，消除 check-then-act 竞态
+        # 注：缓存本体是类属性（进程级共享），见类体定义；
+        # 这里不再为每个实例单独创建，否则 /api/manual/validate 这类
+        # 每请求 new 实例的路径会各自请求 TMDB/LLM
+        logger.info("VideoRenamer: TMDB 缓存已初始化（进程级共享）")
 
         # 手动规则引擎初始化
         self.rule_engine = None
@@ -2420,7 +2458,7 @@ class VideoRenamer:
         self, search_term: str, media_type_hint: str, year: Optional[str], language: Optional[str]
     ) -> List[Dict]:
         """
-        基于语言的搜索辅助方法（支持分页）
+        基于语言的搜索辅助方法（支持分页，带 single-flight 合并与结果缓存）
 
         Args:
             search_term (str): 搜索词
@@ -2430,72 +2468,98 @@ class VideoRenamer:
 
         Returns:
             List[Dict]: 搜索结果列表
+
+        ⚙ 同一搜索词被并发调用（同一目录多集 / 多个 renamer 实例）时，
+        只发起一次真实 TMDB 请求，其余调用等待并复用其结果；
+        空结果也短时缓存（TTL），避免“识别失败”的搜索词被反复重试打爆 TMDB 限速。
         """
-        results = []
-        try:
-            # 直接使用搜索词，不翻译
-            final_search_term = search_term
-            tmdb = self.tmdb_client
+        cache_key = (search_term, media_type_hint, year, language)
 
-            # 安全地处理年份参数，避免无效年份导致搜索失败
-            year_param = None
-            if year:
-                try:
-                    year_param = int(year)
-                except (ValueError, TypeError):
-                    logger.warning(
-                        f"无效的年份值: '{year}'，将不使用年份过滤条件进行搜索"
-                    )
-                    year_param = None
+        # 空结果短时缓存过期清理（防止 429/网络抖动后搜索词被永久标记失败）
+        expiry = self._search_empty_ttl.get(cache_key)
+        if expiry is not None and time.time() > expiry:
+            self._search_cache.pop(cache_key, None)
+            self._search_empty_ttl.pop(cache_key, None)
 
-            # 搜索方法选择
-            if media_type_hint == "tv":
-                method_name = "search_tv"
-            elif media_type_hint == "movie":
-                method_name = "search_movie"
-            else:
-                return results
+        cached = self._search_cache.get(cache_key)
+        if cached is not None:
+            logger.debug(f"TMDB 搜索缓存命中: {cache_key}")
+            return list(cached)
 
-            # 1. 第一次搜索：使用年份参数（分页搜索）
-            results = tmdb.search_all_pages(
-                method_name, final_search_term,
-                max_pages=self.max_search_pages,
-                year=year_param,
-                language=language,
-            )
+        def _do_search() -> List[Dict]:
+            """真实搜索流程（single-flight 的 leader 执行体）。"""
+            results = []
+            try:
+                # 直接使用搜索词，不翻译
+                final_search_term = search_term
+                tmdb = self.tmdb_client
 
-            # 2. 降级搜索：如果没有找到结果且使用了年份参数，则去掉年份重新搜索
-            if not results and year_param:
-                logger.info(
-                    f"使用年份 {year_param} 搜索无结果，尝试去掉年份参数重新搜索"
-                )
+                # 安全地处理年份参数，避免无效年份导致搜索失败
+                year_param = None
+                if year:
+                    try:
+                        year_param = int(year)
+                    except (ValueError, TypeError):
+                        logger.warning(
+                            f"无效的年份值: '{year}'，将不使用年份过滤条件进行搜索"
+                        )
+                        year_param = None
+
+                # 搜索方法选择
+                if media_type_hint == "tv":
+                    method_name = "search_tv"
+                elif media_type_hint == "movie":
+                    method_name = "search_movie"
+                else:
+                    return results
+
+                # 1. 第一次搜索：使用年份参数（分页搜索）
                 results = tmdb.search_all_pages(
                     method_name, final_search_term,
                     max_pages=self.max_search_pages,
-                    year=None,
+                    year=year_param,
                     language=language,
                 )
-                if results:
-                    logger.info(f"去掉年份后搜索到 {len(results)} 个结果")
 
-            # 3. Web 搜索兜底：API 搜索无结果时爬取 TMDB 网站
-            if not results and self.tmdb_client:
-                logger.info(
-                    f"API 搜索无结果，尝试 TMDB 网站搜索兜底: '{final_search_term}'"
-                )
-                web_results = self.tmdb_client.search_web_fallback(
-                    final_search_term, language=language,
-                    media_type=media_type_hint,
-                )
-                if web_results:
-                    results = web_results
+                # 2. 降级搜索：如果没有找到结果且使用了年份参数，则去掉年份重新搜索
+                if not results and year_param:
                     logger.info(
-                        f"TMDB 网站搜索返回 {len(results)} 个结果"
+                        f"使用年份 {year_param} 搜索无结果，尝试去掉年份参数重新搜索"
                     )
-        except Exception as e:
-            logger.error(f"语言搜索失败: {e}")
+                    results = tmdb.search_all_pages(
+                        method_name, final_search_term,
+                        max_pages=self.max_search_pages,
+                        year=None,
+                        language=language,
+                    )
+                    if results:
+                        logger.info(f"去掉年份后搜索到 {len(results)} 个结果")
 
-        return results
+                # 3. Web 搜索兜底：API 搜索无结果时爬取 TMDB 网站
+                if not results and self.tmdb_client:
+                    logger.info(
+                        f"API 搜索无结果，尝试 TMDB 网站搜索兜底: '{final_search_term}'"
+                    )
+                    web_results = self.tmdb_client.search_web_fallback(
+                        final_search_term, language=language,
+                        media_type=media_type_hint,
+                    )
+                    if web_results:
+                        results = web_results
+                        logger.info(
+                            f"TMDB 网站搜索返回 {len(results)} 个结果"
+                        )
+            except Exception as e:
+                logger.error(f"语言搜索失败: {e}")
+
+            return results
+
+        results = self._search_cache.get_or_create(cache_key, _do_search)
+        if not results:
+            # 空结果短时缓存：失败结论在短时间内稳定，避免同词反复重试
+            self._search_empty_ttl[cache_key] = time.time() + _SEARCH_EMPTY_TTL
+            logger.debug(f"TMDB 搜索空结果已缓存 {_SEARCH_EMPTY_TTL}s: {cache_key}")
+        return list(results) if results else results
 
     def _resolve_ambiguous_media_type_via_tmdb(
         self, metadata: Dict, year: Optional[Union[int, str]]
@@ -2530,57 +2594,59 @@ class VideoRenamer:
 
         # 缓存 key，避免批量处理时重复请求
         cache_key = ("_type_resolve", search_term, target_year)
-        if cache_key in self._type_resolve_cache:
-            cached = self._type_resolve_cache[cache_key]
-            logger.info(f"模糊类型判定缓存命中: '{search_term}' -> {cached}")
-            return cached
 
-        try:
-            # 不传年份，multi 搜索同时返回电影和电视剧结果
-            multi_results = self.tmdb_client.search_all_pages(
-                "search_multi",
-                search_term,
-                max_pages=1,
-                year=None,
-                language="zh-CN",
+        def _resolve_type() -> Optional[str]:
+            """multi 搜索 + 年份筛选 + 类型判定（single-flight 的 leader 执行体）。"""
+            try:
+                # 不传年份，multi 搜索同时返回电影和电视剧结果
+                multi_results = self.tmdb_client.search_all_pages(
+                    "search_multi",
+                    search_term,
+                    max_pages=1,
+                    year=None,
+                    language="zh-CN",
+                )
+            except Exception as e:
+                logger.error(f"模糊类型判定 multi 搜索失败: {e}")
+                return None
+
+            if not multi_results:
+                return None
+
+            # 按年份本地筛选，分离匹配的电影和电视剧
+            tv_matched = []
+            movie_matched = []
+            for result in multi_results:
+                mtype = result.get("media_type")
+                if mtype == "tv" and self._result_matches_year(
+                    result, target_year, is_tv=True, metadata=metadata
+                ):
+                    tv_matched.append(result)
+                elif mtype == "movie" and self._result_matches_year(
+                    result, target_year, is_tv=False, metadata=metadata
+                ):
+                    movie_matched.append(result)
+
+            # 只有单一类型匹配才判定，否则保持原判断
+            if tv_matched and not movie_matched:
+                resolved = "tv"
+            elif movie_matched and not tv_matched:
+                resolved = "movie"
+            else:
+                resolved = None
+
+            logger.info(
+                f"模糊类型判定: '{search_term}' ({target_year}) "
+                f"-> {resolved or '无法判定'} "
+                f"(tv匹配{len(tv_matched)}个, movie匹配{len(movie_matched)}个)"
             )
-        except Exception as e:
-            logger.error(f"模糊类型判定 multi 搜索失败: {e}")
-            return None
+            return resolved
 
-        if not multi_results:
-            self._type_resolve_cache[cache_key] = None
-            return None
-
-        # 按年份本地筛选，分离匹配的电影和电视剧
-        tv_matched = []
-        movie_matched = []
-        for result in multi_results:
-            mtype = result.get("media_type")
-            if mtype == "tv" and self._result_matches_year(
-                result, target_year, is_tv=True, metadata=metadata
-            ):
-                tv_matched.append(result)
-            elif mtype == "movie" and self._result_matches_year(
-                result, target_year, is_tv=False, metadata=metadata
-            ):
-                movie_matched.append(result)
-
-        # 只有单一类型匹配才判定，否则保持原判断
-        if tv_matched and not movie_matched:
-            resolved = "tv"
-        elif movie_matched and not tv_matched:
-            resolved = "movie"
-        else:
-            resolved = None
-
-        self._type_resolve_cache[cache_key] = resolved
-        logger.info(
-            f"模糊类型判定: '{search_term}' ({target_year}) "
-            f"-> {resolved or '无法判定'} "
-            f"(tv匹配{len(tv_matched)}个, movie匹配{len(movie_matched)}个)"
+        # get_or_create 自带缓存命中与并发合并；
+        # cache_none=True：无法判定（None）也缓存，避免反复 multi 搜索
+        return self._type_resolve_cache.get_or_create(
+            cache_key, _resolve_type, cache_none=True
         )
-        return resolved
 
     def _result_matches_year(
         self, result: Dict, target_year: int, is_tv: bool, metadata: Dict
@@ -2628,52 +2694,229 @@ class VideoRenamer:
                 target_season = int(target_season)
             except (ValueError, TypeError):
                 target_season = None
-        cache_key = (tmdb_id, target_season)
-        if cache_key in self._season_year_boost_cache:
-            return self._season_year_boost_cache[cache_key]
-        try:
-            details = self.tmdb_client.get_tv_details(tmdb_id)
-            if details and "seasons" in details:
-                for season in details["seasons"]:
-                    season_number = season.get("season_number")
-                    # 跳过第0季（Specials），除非目标季号也是0
-                    if season_number == 0 and target_season != 0:
-                        continue
-                    # 如果指定了目标季号，只检查对应季
-                    if target_season is not None and season_number != target_season:
-                        continue
-                    season_air_date = season.get("air_date", "")
-                    if season_air_date:
-                        season_year = season_air_date.split("-")[0]
-                        if season_year == str(target_year):
-                            logger.info(
-                                f"TMDB ID {tmdb_id} 第{season_number}季播出年份 {season_year} "
-                                f"匹配目标年份 {target_year}，+500 分"
-                            )
-                            self._season_year_boost_cache[cache_key] = 500
-                            return 500
-            # 兜底：用剧集首播年份匹配（适用于季信息不完整的新剧）
-            if details:
-                first_air = details.get("first_air_date", "")
-                if first_air:
-                    first_air_year = first_air.split("-")[0]
-                    if first_air_year == str(target_year):
-                        logger.info(
-                            f"TMDB ID {tmdb_id} 首播年份 {first_air_year} 匹配目标年份 {target_year}，+500 分"
-                        )
-                        self._season_year_boost_cache[cache_key] = 500
-                        return 500
-        except Exception as e:
-            logger.debug(f"获取TMDB剧集详情失败 (ID: {tmdb_id}): {e}")
-        self._season_year_boost_cache[cache_key] = 0
-        return 0
+        # 缓存键必须包含 target_year：同 (tmdb_id, season) 对不同目标年份的
+        # 判定结果不同（匹配才 +500），否则会互相污染导致漏加分
+        cache_key = (tmdb_id, target_season, target_year)
 
-    def _save_to_tmdb_cache(self, metadata: Dict) -> None:
+        def _calc_boost() -> int:
+            """真正查询 TMDB 季播出年份（single-flight 的 leader 执行体）。"""
+            try:
+                details = self.tmdb_client.get_tv_details(tmdb_id)
+                if details and "seasons" in details:
+                    for season in details["seasons"]:
+                        season_number = season.get("season_number")
+                        # 跳过第0季（Specials），除非目标季号也是0
+                        if season_number == 0 and target_season != 0:
+                            continue
+                        # 如果指定了目标季号，只检查对应季
+                        if target_season is not None and season_number != target_season:
+                            continue
+                        season_air_date = season.get("air_date", "")
+                        if season_air_date:
+                            season_year = season_air_date.split("-")[0]
+                            if season_year == str(target_year):
+                                logger.info(
+                                    f"TMDB ID {tmdb_id} 第{season_number}季播出年份 {season_year} "
+                                    f"匹配目标年份 {target_year}，+500 分"
+                                )
+                                return 500
+                # 兜底：用剧集首播年份匹配（适用于季信息不完整的新剧）
+                if details:
+                    first_air = details.get("first_air_date", "")
+                    if first_air:
+                        first_air_year = first_air.split("-")[0]
+                        if first_air_year == str(target_year):
+                            logger.info(
+                                f"TMDB ID {tmdb_id} 首播年份 {first_air_year} 匹配目标年份 {target_year}，+500 分"
+                            )
+                            return 500
+            except Exception as e:
+                logger.debug(f"获取TMDB剧集详情失败 (ID: {tmdb_id}): {e}")
+            return 0
+
+        return self._season_year_boost_cache.get_or_create(cache_key, _calc_boost)
+
+    def _infer_season_from_year(
+        self, tmdb_id: int, target_year: str
+    ) -> Optional[int]:
+        """用年份反推季号：查 TMDB 剧集季列表，恰一个季的播出年份匹配时返回该季号。
+
+        适用场景："死神 千年血战篇 -祸进谭（2026）更新至7集/01.mp4" 的文件名没有季号，
+        但目录年份 2026 是某一季的播出年份（如 Season 04），
+        反推后应识别为 S04 而不是默认的 S01。
+
+        Returns:
+            季号；无匹配 / 多个季同年（无法唯一确定）时返回 None
+        """
+        cache_key = (int(tmdb_id), str(target_year)[:4])
+
+        tmdb_client = self.tmdb_client
+        if tmdb_client is None:
+            return None
+
+        def _calc() -> Optional[int]:
+            """真实查 TMDB 详情（single-flight 的 leader 执行体）。"""
+            try:
+                details = tmdb_client.get_tv_details(tmdb_id)
+                if not details or "seasons" not in details:
+                    return None
+                matched = [
+                    s.get("season_number")
+                    for s in details["seasons"]
+                    if s.get("season_number") not in (None, 0)
+                    and str(s.get("air_date", ""))[:4] == str(target_year)[:4]
+                ]
+                if len(matched) == 1:
+                    return int(matched[0])
+                if len(matched) > 1:
+                    logger.debug(
+                        f"年份反推季号: TMDB ID {tmdb_id} 有多个季播出年份 "
+                        f"{target_year}（{matched}），无法唯一确定，放弃"
+                    )
+            except Exception as e:
+                logger.debug(f"年份反推季号失败 (ID: {tmdb_id}): {e}")
+            return None
+
+        return self._season_infer_cache.get_or_create(
+            cache_key, _calc, cache_none=True
+        )
+
+    def _ensure_season(self, metadata: Dict, entry_year: Optional[str] = None) -> None:
+        """season 缺失时补齐：优先用目录年份反推 TMDB 季号，反推不到再默认第 1 季。
+
+        供各识别路径（完整搜索 / name_key 快速路径 / 缓存命中路径）统一调用，
+        保证同剧多集、跨季目录的 season 一致。
+
+        Args:
+            metadata: 待补齐的元数据
+            entry_year: 入口目录年份（识别过程中 metadata['year'] 会被 TMDB
+                首播年份覆盖，反推季号必须用目录年份——它通常是某季的播出年份）
+        """
+        if metadata.get("season") or not metadata.get("episode"):
+            return
+        year = entry_year or metadata.get("year")
+        tmdb_id = metadata.get("tmdb_id")
+        if year and tmdb_id:
+            try:
+                inferred = self._infer_season_from_year(
+                    int(tmdb_id), str(year)[:4]
+                )
+            except (TypeError, ValueError):
+                inferred = None
+            if inferred:
+                metadata["season"] = inferred
+                logger.info(
+                    f"按年份反推季号: '{metadata.get('show_name', '')}' "
+                    f"({year}) -> Season {inferred}"
+                )
+                return
+        metadata["season"] = 1
+
+    def _build_llm_parse_cache_key(self, filename: str, show_name: str) -> tuple:
+        """构造 LLM 解析缓存键：父目录名 + 原始剧名（不含具体文件名）
+
+        同一目录下的多集（如 "剧名（2026）/01.mp4"、"剧名（2026）/02.mp4"）剧名相同、
+        只有集数不同，缓存键必须排除文件名，否则每集都会重复请求 LLM。
+        """
+        try:
+            parent = Path(str(filename)).parent.name or ""
+        except Exception:
+            parent = ""
+        return (parent, (show_name or "").lower().strip())
+
+    def _parse_filename_with_cache(
+        self, filename: str, cache_key: tuple
+    ) -> Optional[Dict]:
+        """带缓存与并发合并（single-flight）的 LLM 文件名解析
+
+        - 命中缓存直接返回，不再请求 LLM
+        - 未命中时首个请求作为 leader 真正调用 LLM，同 key 的并发请求等待并复用其结果
+        - 只缓存剧名级字段；episode/season 与具体文件相关（每集可能不同），
+          跨集复用会导致集数错乱，因此写入缓存前置空（集数由 GuessIt/正则解析负责）
+        """
+        with self._llm_cache_lock:
+            cached = self._llm_parse_cache.get(cache_key)
+            if cached is not None:
+                logger.info(f"LLM 解析缓存命中: {cache_key}，跳过 LLM 调用")
+                return dict(cached)
+            existing = self._llm_inflight.get(cache_key)
+            event: threading.Event
+            if existing is not None:
+                event = existing
+                is_leader = False
+            else:
+                event = threading.Event()
+                self._llm_inflight[cache_key] = event
+                is_leader = True
+
+        if not is_leader:
+            logger.info(f"LLM 解析已有同类请求在途，等待其结果: {cache_key}")
+            if not event.wait(timeout=self._llm_wait_timeout):
+                logger.warning(f"LLM 解析等待同类请求超时: {cache_key}")
+                return None
+            with self._llm_cache_lock:
+                cached = self._llm_parse_cache.get(cache_key)
+            if cached is None:
+                logger.info(f"LLM 同类请求未产出可用结果: {cache_key}")
+                return None
+            logger.info(f"LLM 解析复用并发请求结果: {cache_key}")
+            return dict(cached)
+
+        translator = self.llm_translator
+        if translator is None:
+            with self._llm_cache_lock:
+                self._llm_inflight.pop(cache_key, None)
+            event.set()
+            return None
+
+        # 只有真正要发请求的 leader 才占用并发槽；等待者不占槽，
+        # 避免 max_concurrent 较小时等待方把槽位占满、后续文件被直接跳过
+        if not self._llm_semaphore.acquire(timeout=self._llm_wait_timeout):
+            logger.warning("LLM 并发已达上限，放弃本次解析并唤醒等待者")
+            with self._llm_cache_lock:
+                self._llm_inflight.pop(cache_key, None)
+            event.set()
+            return None
+
+        try:
+            result = translator.parse_filename(filename)
+        except Exception:
+            # 异常交由调用方处理，但必须唤醒等待者，避免死等
+            with self._llm_cache_lock:
+                self._llm_inflight.pop(cache_key, None)
+            event.set()
+            raise
+        finally:
+            self._llm_semaphore.release()
+
+        if result:
+            cacheable = dict(result)
+            # 集数/季数与具体文件相关，不得跨集复用（剧名/年份/类型才是目录级信息）
+            cacheable["episode"] = None
+            cacheable["season"] = None
+            with self._llm_cache_lock:
+                self._llm_parse_cache[cache_key] = cacheable
+            logger.info(
+                f"LLM 解析结果已缓存: {cache_key} -> show_name="
+                f"'{cacheable.get('show_name')}'"
+            )
+        else:
+            logger.debug(f"LLM 解析无结果，不写入缓存: {cache_key}")
+
+        with self._llm_cache_lock:
+            self._llm_inflight.pop(cache_key, None)
+        event.set()
+        return result
+
+    def _save_to_tmdb_cache(self, metadata: Dict, search_alias: Optional[str] = None) -> None:
         """
         将元数据保存到 TMDB 缓存，供同一剧集的其他集数使用
-        
+
         Args:
             metadata: 已获取完整元数据的字典
+            search_alias: 本次识别实际使用的原始搜索名（如 LLM 兜底前的文件名剧名）。
+                纠正后的名字与原始名不同时必须登记别名，否则同目录下一集
+                仍会用原始名查找而缓存 miss，导致每集重复走 LLM 兜底
         """
         show_name = metadata.get("show_name") or metadata.get("title", "")
         tmdb_id = metadata.get("tmdb_id")
@@ -2683,6 +2926,16 @@ class VideoRenamer:
         if not show_name or not tmdb_id:
             return
         
+        # 只保存基础信息，不保存集数等变化的信息（多个缓存键共用）
+        cache_data = {}
+        for key in ["show_name", "title", "year", "tmdb_id", "genres", "origin_country",
+                   "original_name", "poster_path", "backdrop_path", "networks",
+                   "number_of_seasons", "number_of_episodes", "first_air_date",
+                   "last_air_date", "status", "original_language", "overview", "rating",
+                   "media_type"]:
+            if key in metadata:
+                cache_data[key] = metadata[key]
+
         # 保存 name -> tmdb_id 映射（含 media_type 防同名电影/剧集污染）
         name_key = f"{show_name.lower().strip()}_{media_type}"
         if name_key and name_key not in self._tmdb_name_to_id:
@@ -2692,31 +2945,28 @@ class VideoRenamer:
         # 保存完整元数据缓存（含 media_type 防跨类型污染）
         cache_key = f"tmdb_{tmdb_id}_{media_type}"
         if cache_key not in self._tmdb_cache:
-            # 只保存基础信息，不保存集数等变化的信息
-            cache_data = {}
-            for key in ["show_name", "title", "year", "tmdb_id", "genres", "origin_country",
-                       "original_name", "poster_path", "backdrop_path", "networks",
-                       "number_of_seasons", "number_of_episodes", "first_air_date",
-                       "last_air_date", "status", "original_language", "overview", "rating",
-                       "media_type"]:
-                if key in metadata:
-                    cache_data[key] = metadata[key]
             self._tmdb_cache[cache_key] = cache_data
             logger.info(f"TMDB 缓存: 保存元数据 {show_name} (TMDB ID: {tmdb_id})")
         
         # 同时保存名称键的缓存
         name_cache_key = f"{show_name}_{year}_{media_type}".lower().strip()
         if name_cache_key and name_cache_key not in self._tmdb_cache:
-            cache_data = {}
-            for key in ["show_name", "title", "year", "tmdb_id", "genres", "origin_country",
-                       "original_name", "poster_path", "backdrop_path", "networks",
-                       "number_of_seasons", "number_of_episodes", "first_air_date",
-                       "last_air_date", "status", "original_language", "overview", "rating",
-                       "media_type"]:
-                if key in metadata:
-                    cache_data[key] = metadata[key]
-            self._tmdb_cache[name_cache_key] = cache_data
+            self._tmdb_cache[name_cache_key] = dict(cache_data)
             logger.debug(f"TMDB 缓存: 保存名称键缓存 {name_cache_key}")
+
+        # 登记搜索别名：让下一集用「未纠正的原始名」也能直接命中缓存
+        alias = str(search_alias or "").strip()
+        if alias and alias.lower().strip() != str(show_name).lower().strip():
+            alias_name_key = f"{alias.lower().strip()}_{media_type}"
+            if alias_name_key not in self._tmdb_name_to_id:
+                self._tmdb_name_to_id[alias_name_key] = tmdb_id
+                logger.debug(
+                    f"TMDB 缓存: 保存搜索别名映射 {alias} -> TMDB ID {tmdb_id}"
+                )
+            alias_cache_key = f"{alias}_{year}_{media_type}".lower().strip()
+            if alias_cache_key not in self._tmdb_cache:
+                self._tmdb_cache[alias_cache_key] = dict(cache_data)
+                logger.debug(f"TMDB 缓存: 保存别名键缓存 {alias_cache_key}")
 
     def _search_tmdb_by_type(self, search_term: str, media_type_hint: Optional[str],
                              confidence: float, year: Optional[str] = None,
@@ -2826,9 +3076,16 @@ class VideoRenamer:
             # ========== 缓存检查 ==========
             # 检查是否已有缓存（同一剧集的元数据）
             show_name = metadata.get("show_name", metadata.get("title", ""))
+            # 记录进入本函数时的原始剧名，识别成功后用于登记「搜索别名」：
+            # LLM 兜底/父目录名搜索会把剧名纠正成 TMDB 收录名，不登记别名则
+            # 同目录下一集仍按原始名查找缓存，永远 miss 并重复走 LLM 兜底
+            entry_show_name = show_name
             existing_tmdb_id = metadata.get("tmdb_id")
             media_type = metadata.get("media_type", "")
             year = metadata.get("year", "")
+            # 记录入口目录年份：识别过程中 year 会被 TMDB 首播年份覆盖，
+            # 反推季号必须用「目录年份」（某季的播出年份）而不是首播年份
+            entry_year = year
             
             # 构建缓存键：优先使用 tmdb_id，否则使用 show_name + year + media_type
             cache_key = None
@@ -2838,8 +3095,11 @@ class VideoRenamer:
                 cache_key = f"{show_name}_{year}_{media_type}".lower().strip()
             
             # 检查缓存命中
-            if cache_key and cache_key in self._tmdb_cache:
-                cached_metadata = self._tmdb_cache[cache_key].copy()
+            # 用 get 原子读取：contains + getitem 之间可能被其他线程的 LRU 淘汰打断
+            # （原 dict 无淘汰不会出现，线程安全 LRU 下必须单次原子访问）
+            cached_metadata = self._tmdb_cache.get(cache_key) if cache_key else None
+            if cached_metadata is not None:
+                cached_metadata = cached_metadata.copy()
 
                 # 验证缓存的 media_type 是否匹配当前请求
                 cached_type = cached_metadata.get("media_type")
@@ -2861,12 +3121,20 @@ class VideoRenamer:
                     # 恢复当前文件的质量标签
                     metadata["quality_tags"] = metadata.get("quality_tags", "")
                     metadata["release_group"] = metadata.get("release_group", "")
+                    # 与完整识别路径保持一致：有集数无季数时默认第 1 季
+                    # （否则同目录内「首个文件走完整搜索、后续命中缓存」会因 season 不一致
+                    #   而被分到不同的季目录）
+                    self._ensure_season(metadata, entry_year)
                     return metadata
             
             # 检查是否已有 name -> tmdb_id 的映射（用于同一剧集不同集数，含 media_type 防污染）
             name_key = f"{show_name.lower().strip()}_{media_type}"
-            if show_name and name_key in self._tmdb_name_to_id:
-                cached_tmdb_id = self._tmdb_name_to_id[name_key]
+            cached_tmdb_id = (
+                self._tmdb_name_to_id.get(name_key)
+                if show_name and name_key
+                else None
+            )
+            if cached_tmdb_id is not None:
                 logger.info(f"TMDB 名称缓存命中: {show_name} -> TMDB ID {cached_tmdb_id}")
                 # 使用缓存的 tmdb_id 直接获取详情
                 metadata["tmdb_id"] = cached_tmdb_id
@@ -2974,9 +3242,13 @@ class VideoRenamer:
                             # 恢复原始的quality_tags和release_group
                             metadata["quality_tags"] = original_quality_tags
                             metadata["release_group"] = original_release_group
+                            # 与完整识别路径保持一致：有集数无季数时默认第 1 季
+                            # （本分支是 name_key/已有 tmdb_id 的快速路径，
+                            #   不走主流程末尾的 season 兜底，漏则同季多集 season 不一致）
+                            self._ensure_season(metadata, entry_year)
                             
                             # 保存到缓存
-                            self._save_to_tmdb_cache(metadata)
+                            self._save_to_tmdb_cache(metadata, search_alias=entry_show_name)
                             
                             logger.info(f"使用TMDB ID成功丰富元数据: show_name={metadata.get('show_name')}, year={metadata.get('year')}")
                             return metadata
@@ -3057,9 +3329,11 @@ class VideoRenamer:
                             # 恢复原始的quality_tags和release_group
                             metadata["quality_tags"] = original_quality_tags
                             metadata["release_group"] = original_release_group
+                            # 与完整识别路径保持一致：有集数无季数时默认第 1 季
+                            self._ensure_season(metadata, entry_year)
                             
                             # 保存到缓存
-                            self._save_to_tmdb_cache(metadata)
+                            self._save_to_tmdb_cache(metadata, search_alias=entry_show_name)
                             
                             logger.info(f"使用TMDB ID成功丰富元数据: title={metadata.get('title')}, year={metadata.get('year')}")
                             return metadata
@@ -3090,6 +3364,24 @@ class VideoRenamer:
             # 搜索匹配的视频信息
             # 首先尝试明确的类型搜索
             media_type_hint = metadata.get("media_type", metadata.get("type", ""))
+            # 电影续集号修复：GuessIt 会把 "The.Amazing.Spider-Man.2.2014…" 里的
+            # 数字 2 解析成 season（电影不该有季），导致 show_name 丢失续集号、
+            # 搜索“第一部标题”而误识别成第一部。电影有 season 时视为续集号，
+            # 合并回搜索词（如 "The Amazing Spider Man 2"）再搜。
+            if (
+                media_type_hint == "movie"
+                and metadata.get("season")
+                and not metadata.get("episode")
+            ):
+                sequel_num = str(metadata["season"]).split("-")[0].strip()
+                if sequel_num.isdigit() and search_term and not search_term.rstrip().endswith(
+                    sequel_num
+                ):
+                    search_term = f"{search_term.strip()} {sequel_num}".strip()
+                    logger.info(
+                        f"电影续集号合并回搜索词: "
+                        f"'{metadata.get('show_name')}' -> '{search_term}'"
+                    )
             year = metadata.get("year")
 
             # 安全处理年份参数
@@ -3144,10 +3436,10 @@ class VideoRenamer:
                         pass
                 return text
 
-            # 检查缓存
-            if cache_key in self._search_cache:
+            # 检查缓存（get 原子读取，避免 contains+getitem 间被 LRU 淘汰）
+            results = self._search_cache.get(cache_key)
+            if results is not None:
                 logger.info(f"使用缓存的搜索结果: {cache_key}")
-                results = self._search_cache[cache_key]
             else:
                 # 定义语言检测函数
                 def is_chinese(text):
@@ -3169,6 +3461,14 @@ class VideoRenamer:
                     # 繁简转换
                     target_term_normalized = normalize_chinese(target_term_lower)
 
+                    # 标题归一化：连字符/下划线/点转空格、压缩空白。
+                    # TMDB 收录名常带连字符（"Spider-Man"），文件名预处理后是空格
+                    # （"Spider Man"），不做归一化会永远匹配不上，退化为按人气选错条目
+                    def _norm_title(t):
+                        return re.sub(r"\s+", " ", re.sub(r"[-_.]", " ", t)).strip()
+
+                    target_term_space = _norm_title(target_term_lower)
+
                     all_matches = []
                     for result in search_results:
                         result_title = result.get(
@@ -3186,6 +3486,9 @@ class VideoRenamer:
                             or original_name == target_term_lower
                             or result_title_normalized == target_term_normalized
                             or original_name_normalized == target_term_normalized
+                            # 连字符/下划线/点归一化后相同："spider-man" == "spider man"
+                            or _norm_title(result_title) == target_term_space
+                            or _norm_title(original_name) == target_term_space
                         ):
                             # 如果没有指定目标年份，或者结果有匹配年份，则认为完全匹配
                             if not target_year:
@@ -3684,110 +3987,109 @@ class VideoRenamer:
                     logger.info(f"备选策略1和2都失败，尝试LLM parse_filename识别: {original_filename}")
                     logger.debug(f"DEBUG: LLM兜底时 original_filename = '{original_filename}'")
 
-                    acquired = self._llm_semaphore.acquire(timeout=10)
-                    if acquired:
-                        try:
-                            # 传完整路径给 LLM
-                            llm_result = self.llm_translator.parse_filename(original_filename)
+                    try:
+                        # 传完整路径给 LLM（带缓存 + 并发合并）
+                        # 缓存键排除文件名，使同一目录的多集共享一次 LLM 解析
+                        llm_cache_key = self._build_llm_parse_cache_key(
+                            original_filename, metadata.get("show_name", "")
+                        )
+                        llm_result = self._parse_filename_with_cache(
+                            original_filename, llm_cache_key
+                        )
+                        
+                        if llm_result and llm_result.get("show_name"):
+                            llm_show_name = llm_result["show_name"]
+                            logger.info(f"LLM parse_filename识别结果: show_name='{llm_show_name}'")
                             
-                            if llm_result and llm_result.get("show_name"):
-                                llm_show_name = llm_result["show_name"]
-                                logger.info(f"LLM parse_filename识别结果: show_name='{llm_show_name}'")
-                                
-                                # 根据 LLM 返回结果判断媒体类型
-                                llm_media_type = None
-                                # 优先使用 LLM 返回的 media_type
-                                if llm_result.get("media_type"):
-                                    llm_media_type = llm_result.get("media_type")
-                                    logger.info(f"LLM 返回 media_type: {llm_media_type}")
-                                # 如果 LLM 返回了 episode 或 season，判断为电视剧
-                                elif llm_result.get("episode") or llm_result.get("season"):
-                                    llm_media_type = "tv"
-                                    logger.debug(f"LLM 返回 episode/season，判断为电视剧")
-                                
-                                # 更新 metadata 中的集数信息
-                                if llm_result.get("episode"):
-                                    metadata["episode"] = llm_result["episode"]
-                                if llm_result.get("season"):
-                                    metadata["season"] = llm_result["season"]
-                                if llm_result.get("year"):
-                                    metadata["year"] = llm_result["year"]
-                                
-                                # 确定用于搜索的媒体类型
-                                search_media_type = llm_media_type or media_type_hint
-                                logger.debug(f"TMDB搜索媒体类型: {search_media_type} (llm={llm_media_type}, hint={media_type_hint})")
+                            # 根据 LLM 返回结果判断媒体类型
+                            llm_media_type = None
+                            # 优先使用 LLM 返回的 media_type
+                            if llm_result.get("media_type"):
+                                llm_media_type = llm_result.get("media_type")
+                                logger.info(f"LLM 返回 media_type: {llm_media_type}")
+                            # 如果 LLM 返回了 episode 或 season，判断为电视剧
+                            elif llm_result.get("episode") or llm_result.get("season"):
+                                llm_media_type = "tv"
+                                logger.debug(f"LLM 返回 episode/season，判断为电视剧")
+                            
+                            # 集数/季数不由 LLM 覆盖：走到本分支说明「剧名」识别失败，
+                            # 而集数/季数已由 GuessIt/正则从文件名解析（如 "剧名（2026）/01.mp4" → episode=1）。
+                            # 更关键的是：后续集会命中缓存而不再进入本分支，
+                            # 若在此处由 LLM 补上 season，会造成同目录文件季数不一致、路径被拆散
+                            if llm_result.get("year"):
+                                metadata["year"] = llm_result["year"]
+                            
+                            # 确定用于搜索的媒体类型
+                            search_media_type = llm_media_type or media_type_hint
+                            logger.debug(f"TMDB搜索媒体类型: {search_media_type} (llm={llm_media_type}, hint={media_type_hint})")
 
-                                # 优先使用 LLM 返回的年份，否则使用之前提取的年份
-                                llm_search_year = llm_result.get("year") or search_year
-                                if llm_result.get("year"):
-                                    logger.debug(f"使用 LLM 返回的年份: {llm_result.get('year')}")
-                                
-                                # 根据 LLM 返回的 show_name 重新判断搜索语言
-                                llm_show_name_is_chinese = bool(re.search(r"[\u4e00-\u9fff]", llm_show_name))
-                                llm_primary_language = "zh-CN" if llm_show_name_is_chinese else "en-US"
-                                llm_secondary_language = "en-US" if llm_show_name_is_chinese else "zh-CN"
-                                logger.debug(f"LLM show_name '{llm_show_name}' 包含中文: {llm_show_name_is_chinese}, 搜索语言: {llm_primary_language}")
+                            # 优先使用 LLM 返回的年份，否则使用之前提取的年份
+                            llm_search_year = llm_result.get("year") or search_year
+                            if llm_result.get("year"):
+                                logger.debug(f"使用 LLM 返回的年份: {llm_result.get('year')}")
+                            
+                            # 根据 LLM 返回的 show_name 重新判断搜索语言
+                            llm_show_name_is_chinese = bool(re.search(r"[\u4e00-\u9fff]", llm_show_name))
+                            llm_primary_language = "zh-CN" if llm_show_name_is_chinese else "en-US"
+                            llm_secondary_language = "en-US" if llm_show_name_is_chinese else "zh-CN"
+                            logger.debug(f"LLM show_name '{llm_show_name}' 包含中文: {llm_show_name_is_chinese}, 搜索语言: {llm_primary_language}")
 
-                                # 用 LLM 返回的 show_name 搜索 TMDB
-                                llm_search_results = self._search_with_language(
-                                    llm_show_name,
-                                    search_media_type,
-                                    llm_search_year,
-                                    llm_primary_language,
-                                ) or self._search_with_language(
-                                    llm_show_name,
-                                    search_media_type,
-                                    llm_search_year,
-                                    llm_secondary_language,
-                                )
+                            # 用 LLM 返回的 show_name 搜索 TMDB
+                            llm_search_results = self._search_with_language(
+                                llm_show_name,
+                                search_media_type,
+                                llm_search_year,
+                                llm_primary_language,
+                            ) or self._search_with_language(
+                                llm_show_name,
+                                search_media_type,
+                                llm_search_year,
+                                llm_secondary_language,
+                            )
 
-                                if llm_search_results:
-                                    logger.info(f"LLM识别后搜索返回 {len(llm_search_results)} 个结果")
-                                    results = llm_search_results[:5]
-                                    # 重要：用 LLM 返回的 show_name 作为后续得分计算的搜索词
-                                    search_term = llm_show_name
-                                    search_year = llm_search_year
-                                else:
-                                    # 如果 LLM 提供了 tmdb_corrected_title，用纠正后的标题重试
-                                    corrected_title = llm_result.get("tmdb_corrected_title")
-                                    if corrected_title:
+                            if llm_search_results:
+                                logger.info(f"LLM识别后搜索返回 {len(llm_search_results)} 个结果")
+                                results = llm_search_results[:5]
+                                # 重要：用 LLM 返回的 show_name 作为后续得分计算的搜索词
+                                search_term = llm_show_name
+                                search_year = llm_search_year
+                            else:
+                                # 如果 LLM 提供了 tmdb_corrected_title，用纠正后的标题重试
+                                corrected_title = llm_result.get("tmdb_corrected_title")
+                                if corrected_title:
+                                    logger.info(
+                                        f"LLM搜索无结果，尝试纠正后的TMDB标题: '{corrected_title}'"
+                                    )
+                                    corrected_results = self._search_with_language(
+                                        corrected_title,
+                                        search_media_type,
+                                        llm_search_year,
+                                        llm_primary_language,
+                                    ) or self._search_with_language(
+                                        corrected_title,
+                                        search_media_type,
+                                        llm_search_year,
+                                        llm_secondary_language,
+                                    )
+                                    if corrected_results:
                                         logger.info(
-                                            f"LLM搜索无结果，尝试纠正后的TMDB标题: '{corrected_title}'"
+                                            f"纠正标题后搜索返回 {len(corrected_results)} 个结果"
                                         )
-                                        corrected_results = self._search_with_language(
-                                            corrected_title,
-                                            search_media_type,
-                                            llm_search_year,
-                                            llm_primary_language,
-                                        ) or self._search_with_language(
-                                            corrected_title,
-                                            search_media_type,
-                                            llm_search_year,
-                                            llm_secondary_language,
-                                        )
-                                        if corrected_results:
-                                            logger.info(
-                                                f"纠正标题后搜索返回 {len(corrected_results)} 个结果"
-                                            )
-                                            results = corrected_results[:5]
-                                            search_term = corrected_title
-                                            search_year = llm_search_year
-                                        else:
-                                            logger.warning(
-                                                f"纠正标题后搜索仍无结果，识别失败"
-                                            )
+                                        results = corrected_results[:5]
+                                        search_term = corrected_title
+                                        search_year = llm_search_year
                                     else:
                                         logger.warning(
-                                            f"LLM识别后TMDB搜索无结果，识别失败"
+                                            f"纠正标题后搜索仍无结果，识别失败"
                                         )
-                            else:
-                                logger.warning(f"LLM parse_filename返回空结果，识别失败")
-                        except Exception as e:
-                            logger.error(f"LLM parse_filename失败: {e}")
-                        finally:
-                            self._llm_semaphore.release()
-                    else:
-                        logger.warning("LLM并发已达上限，跳过")
+                                else:
+                                    logger.warning(
+                                        f"LLM识别后TMDB搜索无结果，识别失败"
+                                    )
+                        else:
+                            logger.warning(f"LLM parse_filename返回空结果，识别失败")
+                    except Exception as e:
+                        logger.error(f"LLM parse_filename失败: {e}")
 
             # 如果仍然没有结果，直接返回，不使用降级的show_name
             if not results:
@@ -4188,9 +4490,7 @@ class VideoRenamer:
                     ]  # 限制数量
 
                 # 如果有剧集信息，尝试找到对应的剧集
-                if not metadata.get("season") and metadata.get("episode"):
-                    metadata["season"] = 1
-                    logger.debug(f"未检测到季号，默认使用第一季")
+                self._ensure_season(metadata, entry_year)
 
                 if metadata.get("season") and metadata.get("episode"):
                     # 处理连集 (如 115-120)，提取第一个集号用于搜索
@@ -4249,6 +4549,9 @@ class VideoRenamer:
                     # 确保返回原始metadata，而不是False
                     metadata.pop("parent_show_name", None)
                     return metadata
+                # 与 TV 分支一致：搜索命中后立即落 tmdb_id，
+                # 不能只依赖 external_ids 接口（失败/无数据时 tmdb_id 会丢）
+                metadata["tmdb_id"] = best_match["id"]
                 # 保存原始标题，并处理None值情况
                 original_title = metadata.get("title")
                 original_show_name = metadata.get("show_name")
@@ -4367,7 +4670,7 @@ class VideoRenamer:
             metadata.pop("parent_show_name", None)
 
             # 保存到缓存（供同一剧集的其他集数使用）
-            self._save_to_tmdb_cache(metadata)
+            self._save_to_tmdb_cache(metadata, search_alias=entry_show_name)
             
             return metadata
         except Exception as e:

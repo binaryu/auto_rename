@@ -15,6 +15,8 @@ import re
 import threading
 from typing import Any, Callable, Dict, List, Optional, Union
 
+from ..core.renamer import VideoRenamer
+
 logger = logging.getLogger(__name__)
 
 # 支持的视频扩展名
@@ -42,6 +44,11 @@ class BaseCloudOrganizer:
         self._cancel_flag = False
         self._last_error = ""
         self._folder_lock = threading.Lock()
+        # 复用的文件名识别器：网盘整理会逐文件调用 recognize_file_by_name，
+        # 若每个文件都 new 一个 VideoRenamer，TMDB/LLM 缓存全部失效，
+        # 同一目录的多集将反复请求 TMDB 甚至 LLM
+        self._renamer: Optional[VideoRenamer] = None
+        self._renamer_lock = threading.Lock()
 
     # ==================== 抽象方法（子类实现） ====================
 
@@ -188,8 +195,13 @@ class BaseCloudOrganizer:
             return metadata
 
         try:
-            # 创建临时的 renamer 来识别文件
-            renamer = VideoRenamer(tmdb_api_key=self.tmdb_api_key)
+            # 复用 renamer 实例（懒创建 + 加锁防并发重复创建）：
+            # 缓存跨文件共享，避免每文件重新初始化且丢失缓存
+            if self._renamer is None:
+                with self._renamer_lock:
+                    if self._renamer is None:
+                        self._renamer = VideoRenamer(tmdb_api_key=self.tmdb_api_key)
+            renamer = self._renamer
 
             # 使用 renamer 提取元数据
             extracted = renamer.extract_metadata(file_name)
@@ -210,23 +222,21 @@ class BaseCloudOrganizer:
                         f"元数据不完整，尝试获取完整TMDB信息: {metadata['show_name']}"
                     )
                     try:
-                        renamer_with_tmdb = VideoRenamer(tmdb_api_key=self.tmdb_api_key)
+                        # 复用同一实例的 tmdb_client，避免再建一个 renamer
                         # 使用 show_name 和年份搜索获取完整信息
                         search_term = metadata["show_name"]
                         if metadata.get("year"):
                             search_term = f"{search_term} {metadata['year']}"
 
                         # 搜索电视剧信息
-                        tmdb_results = renamer_with_tmdb.tmdb_client.search_video_show(
+                        tmdb_results = renamer.tmdb_client.search_video_show(
                             search_term, metadata.get("year"), language="zh-CN"
                         )
                         if tmdb_results and "results" in tmdb_results:
                             tmdb_id = tmdb_results["results"][0].get("id")
                             if tmdb_id:
                                 # 获取详细信息
-                                details = renamer_with_tmdb.tmdb_client.get_tv_details(
-                                    tmdb_id
-                                )
+                                details = renamer.tmdb_client.get_tv_details(tmdb_id)
                                 if details:
                                     extracted["genres"] = [
                                         g["name"] for g in details.get("genres", [])
@@ -249,10 +259,7 @@ class BaseCloudOrganizer:
 
                 # 使用 VideoRenamer 的 _determine_category 统一分类
                 try:
-                    renamer_with_config = VideoRenamer(
-                        tmdb_api_key=self.tmdb_api_key, config={}
-                    )
-                    category_path = renamer_with_config._determine_category(extracted)
+                    category_path = renamer._determine_category(extracted)
                     metadata["category_path"] = category_path
                     logger.info(
                         f"识别成功: {file_name} -> {metadata['show_name']} "

@@ -3,7 +3,7 @@
 ## 构建/测试/格式化
 
 - **运行全部可用测试（推荐）:** `pytest tests/unit tests/test_emya_models.py tests/test_organizer.py`
-  （当前 150 passed / 1 failed）
+  （当前 289 passed / 1 failed）
 - **裸跑 `pytest` 会失败:** `tests/integration/test_integration.py` 在收集阶段就 ImportError
   （见「已知问题」），必须先 `--ignore` 或按上面的方式指定路径
 - **运行单个测试文件:** `pytest tests/unit/test_core/test_renamer.py`
@@ -32,7 +32,8 @@
     --web-port/--web-reload/-v`
 - **核心模块** (`src/video_organizer/core/`)：单文件与子包混存，导入前先确认路径
   - `renamer/` — 包，对外只导出 `VideoRenamer`（`from .core.renamer import VideoRenamer`）；
-    内含 `renamer.py`、`ai_parser.py`（LLM 识别）、`category_detector.py`、
+    内含 `renamer.py`（LLM 兜底识别也在此，见 `_parse_filename_with_cache`）、
+    `ai_parser.py`（❗空壳，`extract_with_ai()` 只打 warning 不做事）、`category_detector.py`、
     `chinese_utils.py`、`path_builder.py`
   - `file_handler/handler.py` — `VideoFileHandler` 文件处理主循环（原 `core/video_file_handler.py` 已迁移）
   - `monitor/monitor.py` — `FileSystemMonitor` 目录监控
@@ -49,6 +50,15 @@
     `@register_provider`
   - `media_tracker_client.py`、`subtitle_handler.py`、`file_mover.py`、`db_manager.py`
 - **工具模块** (`src/video_organizer/utils/`):
+  - `cache.py` — `ThreadSafeLRUCache`：带容量上限的线程安全 LRU 容器，
+    `get_or_create()` 提供 single-flight 并发合并；
+    `VideoRenamer` 的全部缓存（`_tmdb_cache` / `_search_cache` / `_type_resolve_cache` /
+    `_season_year_boost_cache` / `_llm_parse_cache` / `_tmdb_name_to_id`）均基于它，
+    超限自动淘汰最久未使用条目，多 worker 并发读写原子；
+    ⚙ 这些缓存是 **VideoRenamer 的类属性（进程级共享）**：同一进程内多个实例
+    （监控 handler / Web 手动验证 / 网盘整理 / emya 入库）共享同一份缓存，
+    否则 `/api/manual/validate` 这类每请求 new 实例的路径会各自请求 TMDB/LLM；
+    测试通过 `tests/conftest.py` 的 autouse fixture 隔离共享缓存
   - `llm_translator.py` — 多 Provider LLM 翻译/识别，负载均衡（round_robin/random/failover/weighted）；
     自动检测 `finish_reason=length` 截断并把 `max_tokens` 翻倍到 `max_tokens_cap` 重试；
     识别 JSON 支持 `tmdb_corrected_title` 纠正片名
@@ -74,7 +84,9 @@
     所以删除/移动类调用必须自己检查 `resp["code"]`，否则会静默失败
   - `yun139_uploader.py` / `yun139_client.py` — 139 移动云盘
   - `media_tracker_uploader.py` — Media Tracker
-  - `base_organizer.py` + `p123_organizer.py` + `yun139_organizer.py` — 网盘整理（`--organize-*`）
+  - `base_organizer.py` + `p123_organizer.py` + `yun139_organizer.py` — 网盘整理（`--organize-*`）；
+    `base_organizer` 复用同一个 `VideoRenamer` 实例（懒加载 + 双重检查锁），
+    整理路径的 TMDB/LLM 缓存跨文件共享，不会逐文件重建
 - **数据库** (`src/video_organizer/database/`): SQLAlchemy（`models.py`, `operations.py`,
   `config_operations.py`, `session.py`），用于 emya 入库、API Key、配置持久化
 - **运行时目录:** `data/`（缓存、139_rapid）、`logs/`、`strm/`、`cas/`（均被 gitignore）
@@ -95,6 +107,34 @@
   - `notify_telegram` — 结果推 `[telegram]`、`max_items` — 统计时最多遍历的条目数
   - 策略固定为「清空回收站」（不可恢复），未做按天数/个数删除；调度器在 `main.py:
     initialize_recycle_cleaner()` 创建并 `set_cleaner()` 注册为全局单例，未启用时也注册（供 Web 手动触发）
+- **LLM 兜底识别配置** (`[llm_fallback]`):
+  - `enabled`、`max_concurrent` — 真正发 LLM 请求的并发槽数
+  - `llm_wait_timeout` — 默认 60（秒），同时用作「排队等并发槽」与「等待在途同类请求」的上限
+  - 兜底只在 TMDB 主搜索 + cleaned_name + 截断 + 父目录名四种策略全部失败后才触发
+  - ⚙ **截断不做数字季号截断**——`晚酌的流派5：夏篇`、电影续作
+    `终结者2：审判日` 等一律按原名搜索，宁可识别失败走 LLM，也不允许截成第一部
+    （`tests/test_renamer_llm_cache.py::TestNoAggressiveTruncation` 覆盖该约束）
+  - ⚙ **按年份反推季号**：文件名无季号但有目录年份时（如
+    `死神 千年血战篇 -祸进谭（2026）更新至7集/01.mp4`），识别成功后用目录年份
+    （`entry_year`，识别过程中 year 会被 TMDB 首播年份覆盖，反推必须用入口值）
+    反查 TMDB 剧集季列表的 `air_date`，恰一个季匹配则采用（`_infer_season_from_year`），
+    否则默认第 1 季（`_ensure_season` 统一兜底，所有识别路径共用）
+  - ⚙ **电影续集号不回吞**：`The.Amazing.Spider-Man.2.2014…` 的续集号 2 会被
+    GuessIt 解析成 season，movie + season 时把续集号合并回搜索词（`The Amazing Spider Man 2`）；
+    同时 `has_exact_match` 对标题做连字符/下划线归一化（`Spider-Man` == `Spider Man`），
+    否则 TMDB 收录名带连字符永远匹配不上、退化为按人气选错条目；
+    movie 搜索命中后立即落 `tmdb_id`（不依赖 external_ids）
+    （`TestMovieSequel` 覆盖）
+  - ⚙ **TMDB 搜索带 single-flight + 空结果短时缓存**：`_search_with_language()` 对
+    同 (搜索词, 类型, 年份, 语言) 的并发调用只发一次真实请求；空结果缓存
+    `_SEARCH_EMPTY_TTL`（600s），避免识别失败的搜索词被多文件反复重试打爆限速；
+    `search_web_fallback` 也走进程级全局限速器（`_global_rate_limiter`）
+  - ⚙ 同一目录的多集（如 `剧名（2026）/01.mp4`、`02.mp4`）只调一次 LLM：
+    `renamer._parse_filename_with_cache()` 按「父目录 + 原始剧名」缓存并做 single-flight
+    并发合并（等待者不占并发槽）；纠正后的剧名会作为「搜索别名」写入
+    `_tmdb_cache` / `_tmdb_name_to_id`，否则下一集仍按未纠正名查找而永远 miss
+  - LLM 只贡献剧名级信息（show_name / tmdb_corrected_title / year / media_type），
+    episode/season 一律由文件名解析决定，不取 LLM 的猜测
 - **LLM Provider 配置** (`[llm_provider_N]`):
   - `api_url`, `api_key`, `model`, `name` — 基本连接参数
   - `max_tokens` — 最大输出 token（默认 4096，推理模型需更大预算）
