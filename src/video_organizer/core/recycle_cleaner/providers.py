@@ -22,6 +22,18 @@ logger = logging.getLogger(__name__)
 
 __all__ = ["P123RecycleProvider"]
 
+# 123 云盘的「异步成功码」：接口已完成本次操作，但空间释放后台延迟执行。
+# 实测（真实账号）：
+#   file/trash_delete_all → code=7301 "已清空，系统释放空间需要一段时间，请稍后查看"
+#   file/delete           → code=7301 "已删除，系统释放空间需要一段时间，请稍后查看"
+# 两者执行后回收站条目数均归 0，因此 7301 必须当作成功，否则清理会误报失败。
+ASYNC_SUCCESS_CODES = frozenset({7301})
+
+
+def is_success_code(code) -> bool:
+    """判断 123 接口返回码是否代表操作成功（含异步成功码）"""
+    return code in (0, 200) or code in ASYNC_SUCCESS_CODES
+
 
 @register_provider
 class P123RecycleProvider(BaseRecycleProvider):
@@ -102,8 +114,9 @@ class P123RecycleProvider(BaseRecycleProvider):
             return False, str(exc)
         code = resp.get("code")
         message = str(resp.get("message") or "")
-        if code in (0, 200):
-            logger.info(f"[{self.name}] 回收站已清空")
+        if is_success_code(code):
+            # 7301 表示已清空、容量稍后释放，不是失败
+            logger.info(f"[{self.name}] 回收站已清空: {message}")
             return True, message or "回收站已清空"
         logger.warning(f"[{self.name}] 清空回收站失败: code={code} {message}")
         return False, message or f"清空失败（code={code}）"

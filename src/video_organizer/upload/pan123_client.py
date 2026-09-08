@@ -351,7 +351,15 @@ class Pan123Client:
         json_data: Optional[Dict] = None,
         params: Optional[Dict] = None,
         result_obj: bool = False,
+        ok_codes: Tuple[int, ...] = (0, 200),
     ) -> Dict[str, Any]:
+        """发送请求
+
+        Args:
+            ok_codes: 视为成功的返回码。部分接口用非 0 码表达「已受理、后台异步生效」
+                （如 file/trash_delete_all 的 7301），调用方可自行扩展，
+                避免被当成失败记 error 日志。
+        """
         self.ensure_auth()
         api_url = _get_api_url(url)
         is_retry = 0
@@ -365,7 +373,7 @@ class Pan123Client:
                 )
                 body = resp.json()
                 code = body.get("code")
-                if code == 0 or code == 200:
+                if code in ok_codes:
                     return body
                 message = body.get("message", "未知错误")
                 if is_retry < 2 and _is_token_expired(code, message):
@@ -606,7 +614,11 @@ class Pan123Client:
         return {"count": count, "size": size, "truncated": count >= max_items}
 
     def recycle_delete(self, file_ids: Iterable) -> Dict[str, Any]:
-        """彻底删除回收站中的指定文件（文件必须已经在回收站中）"""
+        """彻底删除回收站中的指定文件（文件必须已经在回收站中）
+
+        注意：123 对空列表或已完成时会返回 7301（“已删除，释放空间需要时间”），
+        属于异步成功码，不能当作失败。
+        """
         return self.request(
             FILE_DELETE,
             "POST",
@@ -614,14 +626,20 @@ class Pan123Client:
                 "fileIdList": [{"FileId": fid} for fid in file_ids],
                 "event": "recycleDelete",
             },
+            ok_codes=(0, 200, 7301),
         )
 
     def recycle_clear(self) -> Dict[str, Any]:
-        """清空回收站（彻底删除全部文件，不可恢复）"""
+        """清空回收站（彻底删除全部文件，不可恢复）
+
+        实测成功时返回 code=7301 “已清空，系统释放空间需要一段时间”，
+        因此 7301 列入 ok_codes。
+        """
         return self.request(
             TRASH_DELETE_ALL,
             "POST",
             json_data={"event": "recycleClear"},
+            ok_codes=(0, 200, 7301),
         )
 
     def recycle_restore(self, file_id) -> Dict[str, Any]:

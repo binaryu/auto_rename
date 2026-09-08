@@ -173,7 +173,13 @@ class StubClient(Pan123Client):
 
     def request(self, url, method="POST", json_data=None, params=None, **kwargs):
         self.calls.append(
-            {"url": url, "method": method, "json": json_data, "params": params}
+            {
+                "url": url,
+                "method": method,
+                "json": json_data,
+                "params": params,
+                **kwargs,
+            }
         )
         key = url.rsplit("/b/api", 1)[-1]
         return self.responses.get(key, {"code": 0, "message": "ok", "data": {}})
@@ -359,19 +365,43 @@ class TestP123RecycleProvider:
         provider = P123RecycleProvider({}, client=client)
         assert provider.clear() == (True, "ok")
 
-    def test_clear_failure_returns_message(self):
+    def test_clear_treats_async_code_7301_as_success(self):
+        """7301 是 123 的异步成功码（已清空，空间稍后释放），不能计为失败"""
         client = StubClient(
             {
                 "/file/trash_delete_all": {
                     "code": 7301,
-                    "message": "彻底删除后系统释放空间需要一定时间",
+                    "message": "已清空，系统释放空间需要一段时间，请稍后查看",
                 }
             }
         )
         provider = P123RecycleProvider({}, client=client)
         ok, message = provider.clear()
+        assert ok is True
+        assert "已清空" in message
+
+    def test_recycle_clear_passes_7301_as_ok_code(self):
+        """client 层也要把 7301 当成功，否则 request() 会误记 error 日志"""
+        client = StubClient(
+            {"/file/trash_delete_all": {"code": 7301, "message": "已清空"}}
+        )
+        resp = client.recycle_clear()
+        assert client.calls[0]["ok_codes"] == (0, 200, 7301)
+        assert resp["code"] == 7301
+
+    def test_recycle_delete_passes_7301_as_ok_code(self):
+        client = StubClient({"/file/delete": {"code": 7301, "message": "已删除"}})
+        client.recycle_delete([1])
+        assert client.calls[0]["ok_codes"] == (0, 200, 7301)
+
+    def test_clear_failure_returns_message(self):
+        client = StubClient(
+            {"/file/trash_delete_all": {"code": 500, "message": "服务端异常"}}
+        )
+        provider = P123RecycleProvider({}, client=client)
+        ok, message = provider.clear()
         assert ok is False
-        assert "释放空间" in message
+        assert "服务端异常" in message
 
     def test_clear_without_credentials(self):
         provider = P123RecycleProvider({"p123": {}})
