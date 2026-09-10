@@ -6,7 +6,28 @@
 
 import pytest
 
-from video_organizer.web.routers.strm import _p123_handle_redirect, _p123_trash_temp
+from video_organizer.web.routers.strm import (
+    _p123_collect_trash_ids,
+    _p123_handle_redirect,
+    _p123_trash_temp,
+)
+
+# 线上真实秒传响应（VIP 账号，Reuse 命中已存在条目），两个 FileId 开不一致
+PRODUCTION_DATA = {
+    "FileId": 85144550215580,  # 秒传会话 id，不是网盘条目 id
+    "Reuse": True,
+    "Key": "4070d963/1831380981-0/4070d9632753b2400d242d5af4b9f384",
+    "Info": {
+        "FileId": 40376421,  # 网盘里真实存在的条目
+        "FileName": "财阀X刑警 (2024) S02E02 1080p.Disney.WEB-DL.AAC.Web.H.264-Ocat.mkv",
+        "Size": 2355105503,
+        "ParentFileId": 25701165,
+        "Etag": "4070d9632753b2400d242d5af4b9f384",
+        "S3KeyFlag": "1831380981-0",
+        "CreateAt": "2026-09-08T18:08:22+08:00",
+        "Trashed": False,
+    },
+}
 
 
 class TrashSpy:
@@ -63,6 +84,43 @@ def make_client(**kwargs):
             return result
 
     return _OnlyTrash(kwargs.get("results", []))
+
+
+# ========== _p123_collect_trash_ids ==========
+
+
+class TestCollectTrashIds:
+    def test_production_payload_returns_both_ids(self):
+        """线上场景：顶层是会话 id，Info 才是条目 id，两个都得删"""
+        assert _p123_collect_trash_ids(PRODUCTION_DATA) == [40376421, 85144550215580]
+
+    def test_info_first_so_real_entry_is_always_attempted(self):
+        ids = _p123_collect_trash_ids(PRODUCTION_DATA)
+        assert ids[0] == 40376421
+
+    def test_top_level_zero_falls_back_to_info(self):
+        data = {"FileId": 0, "Info": {"FileId": 61379972}}
+        assert _p123_collect_trash_ids(data) == [61379972]
+
+    def test_duplicate_ids_collapsed(self):
+        data = {"FileId": 777, "Info": {"FileId": 777}}
+        assert _p123_collect_trash_ids(data) == [777]
+
+    def test_no_info_only_top_level(self):
+        assert _p123_collect_trash_ids({"FileId": 555}) == [555]
+
+    def test_string_ids_coerced(self):
+        assert _p123_collect_trash_ids({"FileId": "0", "Info": {"FileId": "888"}}) == [
+            888
+        ]
+
+    def test_invalid_or_missing_returns_empty(self):
+        assert _p123_collect_trash_ids({}) == []
+        assert _p123_collect_trash_ids({"FileId": 0, "Info": {}}) == []
+        assert (
+            _p123_collect_trash_ids({"FileId": None, "Info": {"FileId": "abc"}}) == []
+        )
+        assert _p123_collect_trash_ids({"FileId": -1, "Info": {"FileId": 0}}) == []
 
 
 # ========== _p123_trash_temp ==========
@@ -241,6 +299,49 @@ class TestHandleRedirectCleanup:
         assert response.status_code == 302
         assert response.headers["location"] == "https://cdn.example.com/video.mkv"
         assert len(client.trash_calls) == 2
+
+    def test_trashes_real_entry_when_ids_differ(self, p123_state):
+        """回归线上场景：顶层 FileId 是秒传会话 id，必须连带删除 Info 里的真实条目
+
+        旧写法只删顶层 id，网盘里的文件永远残留——就是本次问题的根因。
+        """
+        client = p123_state(
+            TrashSpy(upload_response={"code": 0, "data": PRODUCTION_DATA})
+        )
+        response = _p123_handle_redirect(
+            file_size=2355105503,
+            etag="4070d9632753b2400d242d5af4b9f384",
+            file_name="财阀X刑警 (2024) S02E02 1080p.mkv",
+            client_ip="10.0.0.9",
+            s3keyflag="1831380981-0",
+        )
+        assert response.status_code == 302
+        # 真实条目 id 必须在删除列表里（旧代码只删 85144550215580，它就是残留的原因）
+        assert 40376421 in client.trash_calls
+        assert client.trash_calls[0] == 40376421
+        assert set(client.trash_calls) == {40376421, 85144550215580}
+
+    def test_download_info_still_uses_top_level_id(self, p123_state):
+        """取直链仍用顶层 id，不改变现有播放行为"""
+        seen = {}
+
+        class IdAwareSpy(TrashSpy):
+            def get_download_info(self, file_info):
+                seen["file_id"] = file_info.get("FileId")
+                return "https://cdn.example.com/x.mkv"
+
+        p123_state(IdAwareSpy(upload_response={"code": 0, "data": PRODUCTION_DATA}))
+        assert (
+            _p123_handle_redirect(
+                file_size=2355105503,
+                etag="etag-dl-1",
+                file_name="x.mkv",
+                client_ip="10.0.0.10",
+                s3keyflag="1831380981-0",
+            ).status_code
+            == 302
+        )
+        assert seen["file_id"] == 85144550215580
 
     def test_cached_url_skips_second_upload(self, p123_state):
         """同一 IP + etag 命中缓存时不再秒传，也就不再产生新的临时文件"""

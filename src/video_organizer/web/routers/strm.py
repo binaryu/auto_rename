@@ -450,6 +450,38 @@ async def yun139_create_get_download_url(
 # ==================== 123 云盘秒传代理 ====================
 
 
+def _p123_collect_trash_ids(data: dict) -> list:
+    """从秒传响应里提取需要删除的全部 FileId
+
+    123 的 `file/upload_request` 秒传响应里会同时出现**两个不同含义的 id**：
+
+    - 顶层 ``data["FileId"]``：秒传会话/记录 id（实测 VIP 账号为 85144550215580
+      这种大数；有时又为 0），用于 ``get_download_info`` 取直链是有效的
+    - ``data["Info"]["FileId"]``：网盘里**真实的文件条目 id**（带 ParentFileId/CreateAt）
+
+    只拿顶层 id 去调 ``file/trash`` 会删一个不存在的条目，而接口照样返回成功，
+    导致秒传临时文件永久残留在网盘目录里。两个 id 都发一遗删除，谁不存在谁
+    报错（由 _p123_trash_temp 记录），不影响另一个。
+
+    Args:
+        data: 秒传响应中的 ``data`` 字段
+
+    Returns:
+        去重后的 FileId 列表（Info 优先），无有效 id 时返回空列表
+    """
+    info = data.get("Info") or {}
+    candidates = [info.get("FileId"), data.get("FileId")]
+    result = []
+    for fid in candidates:
+        try:
+            fid_int = int(fid)
+        except (TypeError, ValueError):
+            continue
+        if fid_int > 0 and fid_int not in result:
+            result.append(fid_int)
+    return result
+
+
 def _p123_trash_temp(client, file_id, file_name: str) -> bool:
     """把秒传产生的临时文件移入回收站
 
@@ -543,10 +575,15 @@ def _p123_handle_redirect(
         )
 
     file_id = data.get("FileId") or data.get("Info", {}).get("FileId")
+    # 需要删除的条目 id（与取直链的 id 可能不是同一个，见 _p123_collect_trash_ids）
+    trash_ids = _p123_collect_trash_ids(data)
     logger.info(
-        f"123 秒传 data: Reuse={data.get('Reuse')}, FileId={file_id}, Key={data.get('Key')}"
+        f"123 秒传 data: Reuse={data.get('Reuse')}, FileId={file_id}, "
+        f"待删除 id={trash_ids}, Key={data.get('Key')}"
     )
     if not file_id:
+        for trash_id in trash_ids:
+            _p123_trash_temp(client, trash_id, decoded_name)
         return JSONResponse(status_code=500, content={"error": "秒传响应中无 FileId"})
 
     # 未提供 s3keyflag 时从秒传响应中提取
@@ -572,19 +609,22 @@ def _p123_handle_redirect(
     except Exception as e:
         logger.error(f"获取直链异常: {e}", exc_info=True)
         # 取不到直链也要清理，否则临时文件残留在网盘目录中
-        _p123_trash_temp(client, file_id, decoded_name)
+        for trash_id in trash_ids:
+            _p123_trash_temp(client, trash_id, decoded_name)
         return JSONResponse(status_code=500, content={"error": f"获取直链异常: {e}"})
 
     if not download_url:
-        _p123_trash_temp(client, file_id, decoded_name)
+        for trash_id in trash_ids:
+            _p123_trash_temp(client, trash_id, decoded_name)
         return JSONResponse(status_code=500, content={"error": "获取直链失败"})
 
     logger.info(
         f"123 秒传成功，文件: {decoded_name}, FileID: {file_id}, 直链: {download_url[:100]}..."
     )
 
-    # 删除临时文件（失败不影响已拿到的直链，但必须记日志）
-    _p123_trash_temp(client, file_id, decoded_name)
+    # 删除临时文件（取直链用的 id 与网盘条目 id 可能不同，两个都发一遗）
+    for trash_id in trash_ids:
+        _p123_trash_temp(client, trash_id, decoded_name)
 
     # 缓存 1 小时 + 302
     _cache_set(key, download_url, 3600)
