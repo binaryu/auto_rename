@@ -2781,8 +2781,29 @@ class VideoRenamer:
             cache_key, _calc, cache_none=True
         )
 
+    @staticmethod
+    def _has_explicit_season(metadata: Dict) -> bool:
+        """检查文件名/目录名是否有显式季标记（S01 / 第1季 / Season 1 / 第一季）。
+
+        GuessIt 对只有集号的裸文件名会默认补 season=1（如 `第3集 4K.mkv`），
+        这类「默认值」不能被当作可信季号——目录年份可能是某一季的播出年份，
+        需要允许年份反推覆盖；显式标记则始终尊重。
+        """
+        hay = " ".join(
+            str(metadata.get(k) or "")
+            for k in ("show_name", "cleaned_name", "original_filename")
+        )
+        return bool(
+            re.search(
+                r"(?i)(?:^|[\s\-_.(（])s\d{1,2}(?:e\d+)?(?:$|[\s\-_.)）])|"
+                r"第\d+季|第[一二三四五六七八九十百]+季|"
+                r"(?:^|[\s\-_.(（])season\s*\d+",
+                hay,
+            )
+        )
+
     def _ensure_season(self, metadata: Dict, entry_year: Optional[str] = None) -> None:
-        """season 缺失时补齐：优先用目录年份反推 TMDB 季号，反推不到再默认第 1 季。
+        """season 缺失或仅默认值 1 时补齐：优先用目录年份反推 TMDB 季号。
 
         供各识别路径（完整搜索 / name_key 快速路径 / 缓存命中路径）统一调用，
         保证同剧多集、跨季目录的 season 一致。
@@ -2792,24 +2813,48 @@ class VideoRenamer:
             entry_year: 入口目录年份（识别过程中 metadata['year'] 会被 TMDB
                 首播年份覆盖，反推季号必须用目录年份——它通常是某季的播出年份）
         """
-        if metadata.get("season") or not metadata.get("episode"):
+        if not metadata.get("episode"):
             return
+        season = metadata.get("season")
         year = entry_year or metadata.get("year")
         tmdb_id = metadata.get("tmdb_id")
-        if year and tmdb_id:
+
+        def _try_infer() -> Optional[int]:
+            """尝试用年份反推季号。"""
+            if not year or not tmdb_id:
+                return None
             try:
-                inferred = self._infer_season_from_year(
-                    int(tmdb_id), str(year)[:4]
-                )
+                return self._infer_season_from_year(int(tmdb_id), str(year)[:4])
             except (TypeError, ValueError):
-                inferred = None
-            if inferred:
-                metadata["season"] = inferred
-                logger.info(
-                    f"按年份反推季号: '{metadata.get('show_name', '')}' "
-                    f"({year}) -> Season {inferred}"
-                )
+                return None
+
+        if season:
+            # season 已存在：显式季标记（S01/第1季/Season 1）始终尊重；
+            # 若只是 GuessIt 的默认值 1（无显式标记）且带目录年份，
+            # 允许反推覆盖——"一念永恒 完结季（2026）" season 被补成 1，
+            # 实际可能是 Season 4（2026 播出）
+            if self._has_explicit_season(metadata):
                 return
+            if str(season).strip() in ("1", "01"):
+                inferred = _try_infer()
+                if inferred and int(inferred) != int(season):
+                    metadata["season"] = inferred
+                    logger.info(
+                        f"按年份反推季号(覆盖默认1): "
+                        f"'{metadata.get('show_name', '')}' ({year}) -> Season {inferred}"
+                    )
+                return
+            return
+
+        # season 缺失：先反推，反推不到默认第 1 季
+        inferred = _try_infer()
+        if inferred:
+            metadata["season"] = inferred
+            logger.info(
+                f"按年份反推季号: '{metadata.get('show_name', '')}' "
+                f"({year}) -> Season {inferred}"
+            )
+            return
         metadata["season"] = 1
 
     def _build_llm_parse_cache_key(self, filename: str, show_name: str) -> tuple:

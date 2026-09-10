@@ -1087,3 +1087,86 @@ class TestMovieSequel:
         ), f"应识别 The Amazing Spider-Man 2 (102382)，实际 {md.get('tmdb_id')}"
         assert md.get("show_name") == "The Amazing Spider-Man 2"
         assert str(md.get("year")) == "2014"
+
+
+class TestDefaultSeasonNotTrusted:
+    """回归：GuessIt 给裸集号文件名补的默认 season=1 不能被当作可信季号，
+    带目录年份时应允许年份反推覆盖（一念永恒 完结季（2026）→ S04）。"""
+
+    def _stub_details(self, seasons, first_air="2020-01-01"):
+        class Stub:
+            def get_tv_details(self, *a, **k):
+                return {
+                    "name": "一念永恒",
+                    "first_air_date": first_air,
+                    "seasons": [
+                        {"season_number": n, "air_date": d} for n, d in seasons
+                    ],
+                }
+
+        return Stub()
+
+    def test_default_season_1_overridden_by_year(self, renamer):
+        renamer.tmdb_client = self._stub_details(
+            [
+                (1, "2020-01-01"),
+                (2, "2021-01-01"),
+                (3, "2022-01-01"),
+                (4, "2026-01-01"),
+            ]
+        )
+        md = {
+            "show_name": "一念永恒 完结季",
+            "cleaned_name": "第3集 4K",
+            "original_filename": "一念永恒 完结季（2026）/第3集 4K.mkv",
+            "year": "2026",
+            "tmdb_id": 88801,
+            "episode": 3,
+            "season": "1",
+        }
+        renamer._ensure_season(md, entry_year="2026")
+        assert int(md["season"]) == 4
+
+    def test_explicit_season_1_not_overridden(self, renamer):
+        """显式 S01/第1季 标记时，即使目录年份匹配别的季也不覆盖。"""
+        renamer.tmdb_client = self._stub_details([(4, "2026-01-01")])
+        md = {
+            "show_name": "一念永恒",
+            "cleaned_name": "S01E03 4K",
+            "original_filename": "一念永恒/S01/E03 4K.mkv",
+            "year": "2026",
+            "tmdb_id": 88801,
+            "episode": 3,
+            "season": 1,
+        }
+        renamer._ensure_season(md, entry_year="2026")
+        assert md["season"] == 1
+
+    def test_non_default_season_not_overridden(self, renamer):
+        """season=2（非默认值）不覆盖。"""
+        renamer.tmdb_client = self._stub_details([(4, "2026-01-01")])
+        md = {
+            "show_name": "一念永恒",
+            "cleaned_name": "第2季 第3集",
+            "original_filename": "一念永恒（2021）/第2季/第3集.mkv",
+            "year": "2021",
+            "tmdb_id": 88801,
+            "episode": 3,
+            "season": 2,
+        }
+        renamer._ensure_season(md, entry_year="2021")
+        assert md["season"] == 2
+
+    def test_default_season_1_kept_when_no_year_match(self, renamer):
+        renamer.tmdb_client = self._stub_details([(1, "2020-01-01")])
+        md = {
+            "show_name": "一念永恒",
+            "cleaned_name": "第3集",
+            "original_filename": "一念永恒（2026）/第3集.mkv",
+            "year": "2026",
+            "tmdb_id": 88801,
+            "episode": 3,
+            "season": "1",
+        }
+        renamer._ensure_season(md, entry_year="2026")
+        assert int(md["season"]) == 1

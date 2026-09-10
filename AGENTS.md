@@ -3,7 +3,7 @@
 ## 构建/测试/格式化
 
 - **运行全部可用测试（推荐）:** `pytest tests/unit tests/test_emya_models.py tests/test_organizer.py`
-  （当前 289 passed / 1 failed）
+  （当前 296 passed / 1 failed）
 - **裸跑 `pytest` 会失败:** `tests/integration/test_integration.py` 在收集阶段就 ImportError
   （见「已知问题」），必须先 `--ignore` 或按上面的方式指定路径
 - **运行单个测试文件:** `pytest tests/unit/test_core/test_renamer.py`
@@ -115,10 +115,14 @@
     `终结者2：审判日` 等一律按原名搜索，宁可识别失败走 LLM，也不允许截成第一部
     （`tests/test_renamer_llm_cache.py::TestNoAggressiveTruncation` 覆盖该约束）
   - ⚙ **按年份反推季号**：文件名无季号但有目录年份时（如
-    `死神 千年血战篇 -祸进谭（2026）更新至7集/01.mp4`），识别成功后用目录年份
+    `死神 千年血战篇 -祸进谭（2026）更新至7集/01.mp4`、
+    `一念永恒 完结季（2026）/第3集 4K.mkv`），识别成功后用目录年份
     （`entry_year`，识别过程中 year 会被 TMDB 首播年份覆盖，反推必须用入口值）
     反查 TMDB 剧集季列表的 `air_date`，恰一个季匹配则采用（`_infer_season_from_year`），
-    否则默认第 1 季（`_ensure_season` 统一兜底，所有识别路径共用）
+    否则默认第 1 季（`_ensure_season` 统一兜底，所有识别路径共用）；
+    GuessIt 给裸集号文件名补的默认 season=1 不被信任——
+    无显式季标记（S01/第1季/Season 1）且带目录年份时也允许反推覆盖
+    （`_has_explicit_season`，`TestDefaultSeasonNotTrusted` 覆盖）
   - ⚙ **电影续集号不回吞**：`The.Amazing.Spider-Man.2.2014…` 的续集号 2 会被
     GuessIt 解析成 season，movie + season 时把续集号合并回搜索词（`The Amazing Spider Man 2`）；
     同时 `has_exact_match` 对标题做连字符/下划线归一化（`Spider-Man` == `Spider Man`），
